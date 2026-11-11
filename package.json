@@ -1,0 +1,20 @@
+{
+  "name": "zhuan-cloud",
+  "version": "0.1.0",
+  "private": true,
+  "description": "筑算云 —— AI工程项目经营与成本分析平台（阶段一：可预览基础版）",
+  "packageManager": "pnpm@12.16.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "pnpm --parallel --filter ./apps/* dev",
+    "dev:api": "pnpm --filter @zhuan/api dev",
+    "dev:web": "pnpm --filter @zhuan/web dev",
+    "build": "pnpm --filter @zhuan/shared build && pnpm --filter @zhuan/api build && pnpm --filter @zhuan/web build",
+    "db:generate": "pnpm --filter @zhuan/api db:generate",
+    "db:migrate": "pnpm --filter @zhuan/api db:migrate",
+    "db:seed:demo": "pnpm --filter @zhuan/api db:seed:demo",
+    "typecheck": "pnpm -r typecheck"
+  }
+}

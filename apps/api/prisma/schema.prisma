@@ -1,0 +1,490 @@
+// 阶段一数据模型：仅覆盖“登录、会话、项目、项目授权、审计”。
+// 目标成本、实际成本、收入、预测、方案比选等表在后续阶段按业务确认后增量迁移。
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  COMPANY_MANAGEMENT
+  PROJECT_LEAD
+  COST_ENGINEER
+  FIELD_MANAGER
+  SYS_ADMIN
+}
+
+enum ProjectStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+// 第六轮：费用类别（8 类，成本明细必选）
+enum ExpenseCategory {
+  labor
+  material
+  machine
+  subcontract
+  turnover
+  measure
+  site_overhead
+  other
+}
+
+// 第六轮：清单三大分类（分部分项工程费 / 措施项目费 / 其他项目费）
+enum BoqProjectCategory {
+  divisional
+  measure
+  other
+}
+
+enum BoqItemSource {
+  manual
+  import
+}
+
+enum BoqItemStatus {
+  active
+  merged
+  void
+}
+
+enum PricingMethod {
+  QTY_PRICE
+  LUMP_SUM
+}
+
+enum TargetVersionStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  RETURNED
+}
+
+enum ActualEntryStatus {
+  DRAFT
+  SUBMITTED
+  CONFIRMED
+  RETURNED
+}
+
+enum ActualEntryKind {
+  NORMAL
+  REVERSAL
+}
+
+enum ReversalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum CostSourceType {
+  INVOICE
+  SETTLEMENT
+  PAYROLL
+  CONTRACT
+  OTHER
+}
+
+/** 第七轮已废弃，保留枚举仅为兼容旧迁移文件；业务不再引用。 */
+
+model User {
+  id           String    @id @default(cuid())
+  username     String    @unique
+  displayName  String
+  role         UserRole
+  passwordHash String
+  isActive     Boolean   @default(true)
+  isDemo       Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  sessions    Session[]
+  memberships ProjectMember[]
+  auditLogs   AuditLog[]      @relation("ActorAudit")
+}
+
+model Session {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique
+  userId    String
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  revokedAt DateTime?
+  ip        String?
+  userAgent String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Project {
+  id          String        @id @default(cuid())
+  code        String        @unique
+  name        String
+  description String?
+  status      ProjectStatus @default(ACTIVE)
+  createdById String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  // 成本核算口径说明（由项目负责人在项目设置中维护）
+  costCaliberNote String?
+
+  // 第六轮：收入建安税率默认值（%），仅用于合同清单录入时带出，不影响成本模块
+  revenueTaxRate Decimal @default(9) @db.Decimal(5, 2)
+
+  members         ProjectMember[]
+  audits          AuditLog[]
+  workPackages    WorkPackage[]
+  costCodes       CostCode[]
+  targetVersions  TargetCostVersion[]
+  actualEntries   ActualCostEntry[]
+  reversals       CostReversalRequest[]
+  boqItems        ProjectBoqItem[]
+  importTemplates ImportMappingTemplate[]
+  importLogs      ImportLog[]
+  unitProjects    ProjectUnit[]
+}
+
+/** 第六轮：单项工程（如 1#楼、2#楼、地下室），清单项与成本明细的维度。 */
+model ProjectUnit {
+  id          String   @id @default(cuid())
+  projectId   String
+  name        String
+  sortOrder   Int      @default(0)
+  isActive    Boolean  @default(true)
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  project       Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  boqItems      ProjectBoqItem[]
+  targetLines   TargetCostLine[]
+  actualEntries ActualCostEntry[]
+
+  @@unique([projectId, name])
+  @@index([projectId, isActive])
+}
+
+model ProjectMember {
+  id           String   @id @default(cuid())
+  projectId    String
+  userId       String
+  roleCode     UserRole
+  canViewProfit Boolean @default(false)
+  canViewPrice  Boolean @default(false)
+  grantedAt    DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+  @@index([userId])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actorName  String?
+  action     String
+  objectType String
+  objectId   String?
+  projectId  String?
+  beforeJson Json?
+  afterJson  Json?
+  reason     String?
+  result     String   @default("SUCCESS")
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  actor   User?    @relation("ActorAudit", fields: [actorId], references: [id])
+  project Project? @relation(fields: [projectId], references: [id])
+
+  @@index([projectId, createdAt])
+  @@index([actorId, createdAt])
+}
+
+// ============ 第四轮：目标成本＋实际成本 ============
+
+// ============ 第五轮：工作包/成本编码已废弃 ============
+// 模型保留（不物理删除历史表），但不再允许新增和关联，前端入口已隐藏。
+model WorkPackage {
+  id          String   @id @default(cuid())
+  projectId   String
+  code        String
+  name        String
+  isCommon    Boolean  @default(false)
+  isActive    Boolean  @default(true)
+  note        String?
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, code])
+  @@index([projectId])
+}
+
+model CostCode {
+  id          String   @id @default(cuid())
+  projectId   String
+  code        String
+  name        String
+  isActive    Boolean  @default(true)
+  note        String?
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, code])
+  @@index([projectId])
+}
+
+// ============ 第五轮：清单项（BOQ）＋ 导入框架 ============
+
+/** 清单项：收入录入与成本挂接的共同锚点。 */
+model ProjectBoqItem {
+  id               String   @id @default(cuid())
+  projectId        String
+  // 第六轮：三大分类 + 单项工程 + 税率
+  projectCategory  BoqProjectCategory @default(divisional)
+  unitProjectId    String?
+  taxRate          Decimal? @db.Decimal(5, 2)
+  sectionCode      String? // 分部分类编码
+  sectionName      String? // 分部分类名称
+  itemName         String // 项目名称（必填）
+  itemFeature      String? // 项目特征
+  unit             String?
+  quantity         Decimal? @db.Decimal(24, 3) // 工程量，3 位小数
+  unitPriceTaxIncl Decimal? @db.Decimal(18, 2) // 含税综合单价
+  unitPriceTaxExcl Decimal? @db.Decimal(18, 2) // 不含税综合单价
+  amountTaxIncl    Decimal  @default(0) @db.Decimal(18, 2) // 含税合价（后端计算）
+  amountTaxExcl    Decimal  @default(0) @db.Decimal(18, 2) // 不含税合价（后端计算）
+  source           BoqItemSource @default(manual)
+  status           BoqItemStatus @default(active)
+  mergedIntoId     String? // 被合并到的目标记录
+  createdById      String?
+  createdByName    String?
+  idempotencyKey   String?  @unique
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  project       Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  unitProject   ProjectUnit?     @relation(fields: [unitProjectId], references: [id])
+  mergedInto    ProjectBoqItem?  @relation("BoqMerge", fields: [mergedIntoId], references: [id])
+  mergedItems   ProjectBoqItem[] @relation("BoqMerge")
+  targetLines   TargetCostLine[]
+  actualEntries ActualCostEntry[]
+
+  @@index([projectId, status])
+  @@index([projectId, projectCategory])
+  @@index([unitProjectId])
+}
+
+/** Excel 导入字段映射模板（可命名复用）。 */
+model ImportMappingTemplate {
+  id            String   @id @default(cuid())
+  projectId     String
+  name          String
+  mapping       Json // { Excel表头: 系统字段|ignore }
+  createdById   String?
+  createdByName String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, name])
+}
+
+/** 导入日志：记录文件名、上传人、时间、状态。 */
+model ImportLog {
+  id            String   @id @default(cuid())
+  projectId     String
+  fileName      String
+  status        String // HEADERS_READ / MAPPING_SAVED / CONFIRM_PENDING_PARSE
+  templateId    String?
+  headerJson    Json?
+  note          String?
+  createdById   String?
+  createdByName String?
+  createdAt     DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, createdAt])
+}
+
+/** 目标成本版本。已批准版本不可直接编辑；调整 = 基于原版本生成新草稿重新审批。 */
+model TargetCostVersion {
+  id            String              @id @default(cuid())
+  projectId     String
+  versionName   String
+  description   String?
+  caliberText   String?
+  effectiveDate DateTime?
+  status        TargetVersionStatus @default(DRAFT)
+  isAdjustment  Boolean             @default(false)
+  baseVersionId String?
+  adjustReason  String?
+  // 当前适用的批准版本（全项目控制范围汇总只引用它，不累加历史版本）
+  isCurrent     Boolean             @default(false)
+  // 行金额合计的冗余缓存，每次保存明细时由后端十进制重算
+  totalAmount   Decimal             @default(0) @db.Decimal(18, 2)
+
+  createdById     String
+  createdByName   String?
+  submittedById   String?
+  submittedByName String?
+  submittedAt     DateTime?
+  decidedById     String?
+  decidedByName   String?
+  decidedAt       DateTime?
+  decisionComment String?
+
+  idempotencyKey String?  @unique
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  project         Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  lines           TargetCostLine[]
+  baseVersion     TargetCostVersion? @relation("AdjustChain", fields: [baseVersionId], references: [id])
+  derivedVersions TargetCostVersion[] @relation("AdjustChain")
+
+  @@index([projectId, status])
+  @@index([projectId, isCurrent])
+}
+
+model TargetCostLine {
+  id             String          @id @default(cuid())
+  versionId      String
+  // 第五轮：关联清单项（可空）＋ 费用类别（必选）
+  // 第六轮：单项工程（未关联清单项时必选）＋ 含税/不含税口径
+  boqItemId      String?
+  unitProjectId  String?
+  category       ExpenseCategory
+  summary        String
+  pricingMethod  PricingMethod
+  quantity       Decimal?        @db.Decimal(24, 3)
+  unit           String?
+  unitPrice      Decimal?        @db.Decimal(18, 2)
+  // amount = 不含税金额（成本口径），amountTaxIncl/Excl 为双口径留痕
+  amount         Decimal         @db.Decimal(18, 2)
+  amountTaxIncl  Decimal         @default(0) @db.Decimal(18, 2)
+  amountTaxExcl  Decimal         @default(0) @db.Decimal(18, 2)
+  priceTaxIncl   Boolean         @default(true)
+  taxRate        Decimal?        @db.Decimal(5, 2)
+  unitPriceTaxIncl Decimal?      @db.Decimal(18, 2)
+  unitPriceTaxExcl Decimal?      @db.Decimal(18, 2)
+  basisNote      String?
+  sortOrder      Int             @default(0)
+  // 名称快照：清单项后续改名/作废不影响历史版本可读性
+  boqItemName    String?
+
+  version     TargetCostVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  boqItem     ProjectBoqItem?   @relation(fields: [boqItemId], references: [id])
+  unitProject ProjectUnit?      @relation(fields: [unitProjectId], references: [id])
+
+  @@index([versionId])
+  @@index([boqItemId])
+  @@index([unitProjectId])
+}
+
+/** 实际成本单据。只有已确认记录计入正式实际成本；正式记录不可无痕改删，纠错走冲销。 */
+model ActualCostEntry {
+  id            String           @id @default(cuid())
+  projectId     String
+  // 第五轮：关联清单项（可空）＋ 费用类别（必选）
+  // 第六轮：单项工程（未关联清单项时必选）＋ 含税/不含税口径
+  boqItemId     String?
+  unitProjectId String?
+  category      ExpenseCategory
+  businessDate  DateTime
+  period        String // 结算周期 YYYY-MM
+  periodReason  String? // 所属期间与业务日期不一致时必填
+  // 第七轮去财务化：成本说明 + 供应商/分包商名称；不再记录发票与来源单据
+  description   String            @default("")
+  vendorName    String?
+  pricingMethod PricingMethod
+  quantity      Decimal?         @db.Decimal(24, 3)
+  unit          String?
+  unitPrice     Decimal?         @db.Decimal(18, 2)
+  // amount = 不含税金额（成本口径），amountTaxIncl/Excl 为双口径留痕
+  amount        Decimal          @db.Decimal(18, 2)
+  amountTaxIncl Decimal          @default(0) @db.Decimal(18, 2)
+  amountTaxExcl Decimal          @default(0) @db.Decimal(18, 2)
+  priceTaxIncl  Boolean          @default(true)
+  taxRate       Decimal?         @db.Decimal(5, 2)
+  unitPriceTaxIncl Decimal?      @db.Decimal(18, 2)
+  unitPriceTaxExcl Decimal?      @db.Decimal(18, 2)
+  basisNote     String?
+
+  kind            ActualEntryKind   @default(NORMAL)
+  status          ActualEntryStatus @default(DRAFT)
+  createdById     String
+  createdByName   String?
+  submittedById   String?
+  submittedByName String?
+  submittedAt     DateTime?
+  reviewedById    String?
+  reviewedByName  String?
+  reviewedAt      DateTime?
+  reviewComment   String?
+
+  // 冲销关系：负向冲销记录 reversalOf → 原记录；原记录 reversedBy → 冲销记录
+  reversalOfId String? @unique
+  reversedById String? @unique
+  // 重录：新草稿关联的原记录
+  replaceOfId  String?
+
+  idempotencyKey String?  @unique
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  project        Project              @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  boqItem        ProjectBoqItem?      @relation(fields: [boqItemId], references: [id])
+  unitProject    ProjectUnit?         @relation(fields: [unitProjectId], references: [id])
+  reversalOf     ActualCostEntry?     @relation("ReversalLink", fields: [reversalOfId], references: [id])
+  reversalEntry  ActualCostEntry?     @relation("ReversalLink")
+  reversalRequests CostReversalRequest[]
+
+  @@index([projectId, status])
+  @@index([projectId, businessDate])
+  @@index([boqItemId])
+  @@index([unitProjectId])
+}
+
+/** 冲销申请：发起→独立复核→批准后生成关联负向冲销记录，原记录保留。 */
+model CostReversalRequest {
+  id              String         @id @default(cuid())
+  projectId       String
+  entryId         String
+  reason          String
+  status          ReversalStatus @default(PENDING)
+  requestedById   String
+  requestedByName String?
+  requestedAt     DateTime       @default(now())
+  reviewedById    String?
+  reviewedByName  String?
+  reviewedAt      DateTime?
+  reviewComment   String?
+  reversalEntryId String?
+
+  idempotencyKey String? @unique
+
+  project Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  entry   ActualCostEntry @relation(fields: [entryId], references: [id])
+
+  @@index([projectId, status])
+  @@index([entryId])
+}
