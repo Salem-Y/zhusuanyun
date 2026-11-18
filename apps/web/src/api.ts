@@ -266,7 +266,7 @@ export interface ActualEntry {
   unitProjectName?: string | null;
   category: ExpenseCategory;
   businessDate: string;
-  period: string;
+  period?: string | null;
   periodReason?: string | null;
   description: string;
   vendorName?: string | null;
@@ -284,6 +284,8 @@ export interface ActualEntry {
   basisNote?: string | null;
   kind: 'NORMAL' | 'REVERSAL';
   status: ActualEntryStatus;
+  /** 第九轮：台账成本状态，默认预测 */
+  costStatus?: CostStatus;
   createdById: string;
   createdByName?: string | null;
   submittedById?: string | null;
@@ -308,7 +310,7 @@ export interface ActualEntryInput {
   unitProjectId?: string | null;
   category: ExpenseCategory;
   businessDate: string;
-  period: string;
+  period?: string | null;
   periodReason?: string | null;
   description: string;
   vendorName?: string | null;
@@ -321,6 +323,8 @@ export interface ActualEntryInput {
   priceTaxIncl?: boolean;
   basisNote?: string | null;
   replaceOfId?: string | null;
+  /** 第九轮：台账成本状态 */
+  costStatus?: CostStatus;
 }
 
 export interface ReversalRequestItem {
@@ -346,7 +350,11 @@ export type CostCaliber = 'incl' | 'excl';
 
 export interface CostComparisonRow {
   key: string;
+  /** 单行（未合并）时对应的清单项 id；合并父行为 null */
+  boqId?: string | null;
   boqIds: string[];
+  /** 是否为自动合并父行（同名+特征+单位跨单项工程聚合） */
+  isMerged: boolean;
   itemName: string;
   itemFeature?: string | null;
   unit?: string | null;
@@ -362,6 +370,28 @@ export interface CostComparisonRow {
   diff: string;
   hasCost: boolean;
   targetByCategory: CostCategoryMap;
+  // 第八轮：测算大宽表列
+  /** 第 11 列 人工（含机辅）不含税单价 */
+  laborPrice?: string | null;
+  /** 第 12 列 材料不含税单价 */
+  materialPrice?: string | null;
+  /** 第 13 列 专业分包不含税单价 */
+  subcontractPrice?: string | null;
+  laborTaxRate?: string | null;
+  materialTaxRate?: string | null;
+  subcontractTaxRate?: string | null;
+  /** 第 10 列 实际单价 */
+  unitCost?: string | null;
+  /** 第 9 列 预测/实际成本 */
+  cost?: string | null;
+  /** 含税总成本 */
+  costTaxIncl?: string | null;
+  /** 第 14 列 成本状态 */
+  costStatus?: CostStatus | null;
+  /** 子行单价有差异（父行显示浮标） */
+  hasDiffPrice: boolean;
+  /** 展开的子行（按单项工程），叶子行为 null */
+  children?: CostComparisonRow[] | null;
   labor: string;
   material: string;
   machine: string;
@@ -372,6 +402,9 @@ export interface CostComparisonRow {
   other: string;
 }
 
+/** 第八轮：成本状态（预测 / 已定标） */
+export type CostStatus = 'PREDICTED' | 'FIXED';
+
 export interface CostComparisonData {
   rows: CostComparisonRow[];
   totals: {
@@ -380,14 +413,19 @@ export interface CostComparisonData {
     incomeTaxExcl: string;
     actualQuantity: string;
     target: string;
+    /** 第八轮：预测/实际成本合计 */
+    cost: string;
+    costTaxIncl: string;
     actual: string;
-    /** 未关联清单项的实际成本（按当前口径），用于环形图"未分配"扇区 */
-    unlinkedActual: string;
+    /** 第十三轮：已移除“未分配成本”金额，仅保留是否存在未关联台账的标记 */
+    hasUnlinkedActual: boolean;
     diff: string;
     byCategory: CostCategoryMap;
   };
   caliber: CostCaliber;
   categories: Array<{ key: ExpenseCategory; label: string }>;
+  /** 第八轮：全局默认不含税税率（%） */
+  defaultTaxRates: { labor: string; material: string; subcontract: string };
   unitProjects: UnitProject[];
   targetVersion: {
     id: string;
@@ -432,8 +470,9 @@ export interface ProcessCostRow {
   key: string;
   label: string;
   target: string;
-  budgetRevenue: string;
-  actual: string;
+  predicted: string;
+  actualPeriod: string;
+  actualCumulative: string;
   diff: string;
   entryCount: number;
 }
@@ -447,10 +486,15 @@ export interface ProcessCostData {
   rows: ProcessCostRow[];
   totals: {
     target: string;
+    /** 第十轮：预测成本合计（取总账大盘，不随日期回溯） */
+    predicted: string;
     budgetRevenue: string;
     budgetRevenueTaxIncl: string;
     actual: string;
-    unallocatedRevenue: string;
+    /** 第十一轮：本期实际（成本周期等于所选月份） */
+    actualPeriod: string;
+    /** 第十一轮：累计实际（成本周期不晚于所选月份） */
+    actualCumulative: string;
   };
   targetVersion: { id: string; versionName: string; totalAmount: string } | null;
   caliberNote?: string | null;
@@ -745,11 +789,15 @@ export const api = {
     }).then((r) => r.data),
 
   // ===== 第四轮：实际成本 =====
-  listActualEntries: (projectId: string, params: { view?: string; status?: string; until?: string } = {}) => {
+  listActualEntries: (
+    projectId: string,
+    params: { view?: string; status?: string; until?: string; category?: ExpenseCategory } = {},
+  ) => {
     const query = new URLSearchParams();
     if (params.view) query.set('view', params.view);
     if (params.status) query.set('status', params.status);
     if (params.until) query.set('until', params.until);
+    if (params.category) query.set('category', params.category);
     const suffix = query.toString() ? `?${query.toString()}` : '';
     return request<{ data: ActualEntry[] }>(`/projects/${projectId}/actual-entries${suffix}`).then((r) => r.data);
   },
@@ -836,6 +884,48 @@ export const api = {
       (r) => r.data,
     );
   },
+
+  /** 第八轮：保存清单测算行（实际工程量 / 互斥单价 / 单条税率 / 成本状态） */
+  saveCostEstimate: (
+    projectId: string,
+    body: {
+      boqItemId: string;
+      actualQuantity?: string | null;
+      laborPrice?: string | null;
+      materialPrice?: string | null;
+      subcontractPrice?: string | null;
+      laborTaxRate?: string | null;
+      materialTaxRate?: string | null;
+      subcontractTaxRate?: string | null;
+      costStatus?: CostStatus;
+    },
+  ) =>
+    request<{
+      data: {
+        boqItemId: string;
+        actualQuantity: string | null;
+        laborPrice: string | null;
+        materialPrice: string | null;
+        subcontractPrice: string | null;
+        laborTaxRate: string | null;
+        materialTaxRate: string | null;
+        subcontractTaxRate: string | null;
+        costStatus: CostStatus;
+      };
+    }>(`/projects/${projectId}/cost-estimates`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }).then((r) => r.data),
+
+  /** 第八轮：维护全局默认不含税税率（人工 3% / 材料 13% / 分包 9%） */
+  updateDefaultTaxRates: (
+    projectId: string,
+    body: { laborTaxRate: string; materialTaxRate: string; subcontractTaxRate: string },
+  ) =>
+    request<{ data: { labor: string; material: string; subcontract: string } }>(
+      `/projects/${projectId}/default-tax-rates`,
+      { method: 'PUT', body: JSON.stringify(body) },
+    ).then((r) => r.data),
 
   getUnlinkedCosts: (projectId: string, params: { unitProjectId?: string; until?: string } = {}) => {
     const query = new URLSearchParams();

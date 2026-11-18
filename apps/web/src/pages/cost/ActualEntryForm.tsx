@@ -22,6 +22,7 @@ import {
   type ActualEntry,
   type ActualEntryInput,
   type BoqItem,
+  type CostStatus,
   type ExpenseCategory,
   type UnitProject,
 } from '../../api';
@@ -89,22 +90,32 @@ interface EntryFormValues {
   unitPriceTaxIncl?: number | null;
   unitPriceTaxExcl?: number | null;
   amount?: number | null;
+  amountIncl?: number | null;
+  amountExcl?: number | null;
+  /** 第九轮：成本状态（预测 / 已定标） */
+  costStatus?: CostStatus;
 }
 
 /**
- * 极简结算录入：只保留 成本说明 / 供应商 / 结算周期 / 费用类别 / 量价。
- * 底部两个动作：保存草稿、确认结算（确认后立即计入实际成本）。
+ * 极简成本录入：只保留 成本说明 / 供应商 / 成本周期 / 费用类别 / 量价。
+ * 保存后直接计入实际成本（第九轮废除审批流）。
  */
 export function ActualEntryFormModal({
   open,
   entryId,
   presetBoqItemId,
+  hideCostStatus = false,
+  hidePeriod = false,
   onClose,
   onSaved,
 }: {
   open: boolean;
   entryId: string | null;
   presetBoqItemId?: string | null;
+  /** 第十二轮：过程统计录入已发生流水，隐藏“成本状态” */
+  hideCostStatus?: boolean;
+  /** 第十三轮：总账台账不计成本周期 */
+  hidePeriod?: boolean;
   onClose: () => void;
   onSaved: () => void;
 }) {
@@ -113,7 +124,7 @@ export function ActualEntryFormModal({
   const [form] = Form.useForm<EntryFormValues>();
   const [boqItems, setBoqItems] = useState<BoqItem[]>([]);
   const [unitProjects, setUnitProjects] = useState<UnitProject[]>([]);
-  const [saving, setSaving] = useState<'draft' | 'confirm' | null>(null);
+  const [saving, setSaving] = useState(false);
 
   const pricingMethod: 'QTY_PRICE' | 'LUMP_SUM' = Form.useWatch('pricingMethod', form) ?? 'QTY_PRICE';
   const priceMode: 'incl' | 'excl' = Form.useWatch('priceMode', form) ?? 'incl';
@@ -140,7 +151,7 @@ export function ActualEntryFormModal({
           category: e.category,
           description: e.description,
           vendorName: e.vendorName ?? '',
-          period: dayjs(`${e.period}-01`),
+          period: e.period ? dayjs(`${e.period}-01`) : dayjs(),
           pricingMethod: e.pricingMethod,
           quantity: e.quantity ? Number(e.quantity) : null,
           unit: e.unit ?? '',
@@ -149,6 +160,9 @@ export function ActualEntryFormModal({
           unitPriceTaxIncl: e.unitPriceTaxIncl != null ? Number(e.unitPriceTaxIncl) : null,
           unitPriceTaxExcl: e.unitPriceTaxExcl != null ? Number(e.unitPriceTaxExcl) : null,
           amount: e.amount ? Number(e.amount) : null,
+          amountIncl: e.amountTaxIncl != null ? Number(e.amountTaxIncl) : e.amount ? Number(e.amount) : null,
+          amountExcl: e.amountTaxExcl != null ? Number(e.amountTaxExcl) : e.amount ? Number(e.amount) : null,
+          costStatus: e.costStatus ?? 'PREDICTED',
         });
       });
       return;
@@ -158,9 +172,10 @@ export function ActualEntryFormModal({
     const preset = presetBoqItemId ? boqItems.find((b) => b.id === presetBoqItemId) : null;
     form.setFieldsValue({
       boqItemId: presetBoqItemId ?? undefined,
-      unitProjectId: preset?.unitProjectId ?? undefined,
+      unitProjectId: preset?.unitProjectId ?? '',
       pricingMethod: 'QTY_PRICE',
       priceMode: 'incl',
+      costStatus: 'PREDICTED',
       period: dayjs(),
       taxRate: readLastTaxRate(),
     });
@@ -199,13 +214,15 @@ export function ActualEntryFormModal({
     const enteredPrice = v.priceMode === 'excl' ? v.unitPriceTaxExcl : v.unitPriceTaxIncl;
     rememberTaxRate(v.taxRate);
     const period = (v.period ?? dayjs()).format('YYYY-MM');
+    const submittedPeriod = hidePeriod ? null : period;
     return {
-      boqItemId: v.boqItemId ?? null,
-      unitProjectId: v.unitProjectId ?? null,
+      // 第十二轮：空字符串一律转 null，避免后端 min(1) 校验报错
+      boqItemId: v.boqItemId?.trim() ? v.boqItemId : null,
+      unitProjectId: v.unitProjectId?.trim() ? v.unitProjectId : null,
       category: v.category,
-      // 业务日期取结算周期首日，保证月度趋势与结算周期一致
+      // 业务日期取成本周期首日；总账台账取当月首日
       businessDate: `${period}-01`,
-      period,
+      period: submittedPeriod,
       description: v.description.trim(),
       vendorName: v.vendorName?.trim() || null,
       pricingMethod: v.pricingMethod,
@@ -214,44 +231,46 @@ export function ActualEntryFormModal({
       unit: v.pricingMethod === 'QTY_PRICE' ? v.unit?.trim() : undefined,
       unitPrice:
         v.pricingMethod === 'QTY_PRICE' && enteredPrice != null ? String(enteredPrice) : undefined,
-      amount: v.pricingMethod === 'LUMP_SUM' && v.amount != null ? String(v.amount) : undefined,
+      amount:
+        v.pricingMethod === 'LUMP_SUM'
+          ? (() => {
+              const raw = v.priceMode === 'incl' ? v.amountIncl : v.amountExcl;
+              return raw != null ? String(raw) : undefined;
+            })()
+          : undefined,
       taxRate: v.taxRate != null ? String(v.taxRate) : undefined,
       priceTaxIncl: v.priceMode !== 'excl',
+      costStatus: (v.costStatus ?? 'PREDICTED') as CostStatus,
     };
   };
 
-  const submit = async (mode: 'draft' | 'confirm') => {
+  const submit = async () => {
     const values = await form.validateFields();
     void values;
-    setSaving(mode);
+    setSaving(true);
     try {
       const payload = buildPayload();
-      let savedId = entryId;
       if (entryId) {
         await api.updateActualEntry(project.id, entryId, payload);
       } else {
-        const created = await api.createActualEntry(project.id, {
+        await api.createActualEntry(project.id, {
           ...payload,
           idempotencyKey: newIdempotencyKey(),
         });
-        savedId = created.id;
       }
-      if (mode === 'confirm' && savedId) {
-        await api.confirmActualEntry(project.id, savedId);
-      }
-      message.success(mode === 'confirm' ? '结算已确认，已计入实际成本' : '草稿已保存');
+      message.success('成本明细已保存');
       onClose();
       onSaved();
     } catch (e) {
       message.error((e as Error).message);
     } finally {
-      setSaving(null);
+      setSaving(false);
     }
   };
 
   return (
     <Modal
-      title={entryId ? '编辑结算草稿' : '录入结算'}
+      title="成本明细"
       open={open}
       onCancel={onClose}
       width={720}
@@ -259,17 +278,24 @@ export function ActualEntryFormModal({
       footer={
         <Space>
           <Button onClick={onClose}>取消</Button>
-          <Button loading={saving === 'draft'} onClick={() => void submit('draft')}>
-            保存草稿
-          </Button>
-          <Button type="primary" loading={saving === 'confirm'} onClick={() => void submit('confirm')}>
-            确认结算
+          <Button type="primary" loading={saving} onClick={() => void submit()}>
+            保存
           </Button>
         </Space>
       }
     >
       <Form form={form} layout="vertical">
         <Space size={12} wrap style={{ width: '100%' }}>
+          {!hideCostStatus && (
+            <Form.Item name="costStatus" label="成本状态" style={{ width: 140 }}>
+              <Select
+                options={[
+                  { value: 'PREDICTED', label: '预测' },
+                  { value: 'FIXED', label: '已定标' },
+                ]}
+              />
+            </Form.Item>
+          )}
           <Form.Item
             name="boqItemId"
             label="关联清单项（可空）"
@@ -287,23 +313,14 @@ export function ActualEntryFormModal({
               }))}
             />
           </Form.Item>
-          <Form.Item
-            name="unitProjectId"
-            label="单项工程（未关联清单项时必选）"
-            style={{ width: 230 }}
-            rules={[
-              ({ getFieldValue }) => ({
-                validator: (_, value) =>
-                  value || getFieldValue('boqItemId')
-                    ? Promise.resolve()
-                    : Promise.reject(new Error('请选择单项工程')),
-              }),
-            ]}
-          >
+          <Form.Item name="unitProjectId" label="单项工程" style={{ width: 250 }}>
             <Select
-              placeholder="选择单项工程"
+              placeholder="项目公共（不分单项工程）"
               allowClear
-              options={unitProjects.map((u) => ({ value: u.id, label: u.name }))}
+              options={[
+                { value: '', label: '项目公共（不分单项工程）' },
+                ...unitProjects.map((u) => ({ value: u.id, label: u.name })),
+              ]}
               notFoundContent="请先在「项目设置 - 单项工程」中维护"
             />
           </Form.Item>
@@ -327,15 +344,16 @@ export function ActualEntryFormModal({
             rules={[{ required: true, message: '请填写成本说明' }, { max: 200 }]}
             style={{ width: 380 }}
           >
-            <Input placeholder="如：9 月土方结算" />
+            <Input placeholder="如：9 月土方成本" />
           </Form.Item>
           <Form.Item name="vendorName" label="供应商 / 分包商" style={{ width: 240 }} rules={[{ max: 80 }]}>
             <Input placeholder="如：福州某某土方队" />
           </Form.Item>
           <Form.Item
             name="period"
-            label="结算周期"
-            rules={[{ required: true, message: '请选择结算周期' }]}
+            label="成本周期"
+            hidden={hidePeriod}
+            rules={hidePeriod ? [] : [{ required: true, message: '请选择成本周期' }]}
             style={{ width: 160 }}
           >
             <DatePicker picker="month" style={{ width: '100%' }} />
@@ -347,7 +365,7 @@ export function ActualEntryFormModal({
             <Select
               options={[
                 { value: 'QTY_PRICE', label: '数量×单价' },
-                { value: 'LUMP_SUM', label: '按总额' },
+                { value: 'LUMP_SUM', label: '按总额登记' },
               ]}
             />
           </Form.Item>
@@ -432,20 +450,67 @@ export function ActualEntryFormModal({
             </Form.Item>
           </Space>
         ) : (
-          <Form.Item
-            name="amount"
-            label={`金额（元，${priceMode === 'incl' ? '含税' : '不含税'}）`}
-            rules={[{ required: true, message: '请填写金额' }]}
-          >
-            <InputNumber min={0} precision={2} style={{ width: 220 }} />
-          </Form.Item>
+          <Space size={12} wrap style={{ width: '100%' }}>
+            <Form.Item
+              name="amountIncl"
+              label="金额（含税，元）"
+              rules={[
+                {
+                  validator: (_, value) =>
+                    priceMode === 'incl' && !value
+                      ? Promise.reject(new Error('请填写含税金额'))
+                      : Promise.resolve(),
+                },
+              ]}
+            >
+              <InputNumber
+                min={0}
+                precision={2}
+                style={{ width: 200 }}
+                disabled={priceMode === 'excl'}
+                onChange={(v) => {
+                  if (priceMode !== 'incl') return;
+                  form.setFieldValue(
+                    'amountExcl',
+                    calcCounterpart(v as number | null, form.getFieldValue('taxRate') as number | null, true),
+                  );
+                }}
+              />
+            </Form.Item>
+            <Form.Item
+              name="amountExcl"
+              label="金额（不含税，元）"
+              rules={[
+                {
+                  validator: (_, value) =>
+                    priceMode === 'excl' && !value
+                      ? Promise.reject(new Error('请填写不含税金额'))
+                      : Promise.resolve(),
+                },
+              ]}
+            >
+              <InputNumber
+                min={0}
+                precision={2}
+                style={{ width: 200 }}
+                disabled={priceMode === 'incl'}
+                onChange={(v) => {
+                  if (priceMode !== 'excl') return;
+                  form.setFieldValue(
+                    'amountIncl',
+                    calcCounterpart(v as number | null, form.getFieldValue('taxRate') as number | null, false),
+                  );
+                }}
+              />
+            </Form.Item>
+          </Space>
         )}
       </Form>
     </Modal>
   );
 }
 
-/** 结算详情：只读展示，不做任何自动弹窗或流程跳转。 */
+/** 成本明细：只读展示，不做任何自动弹窗或流程跳转。 */
 export function EntryDetailDrawer({
   entryId,
   onClose,
@@ -479,7 +544,7 @@ export function EntryDetailDrawer({
     setActing(true);
     try {
       await api.confirmActualEntry(project.id, entry.id);
-      message.success('结算已确认，已计入实际成本');
+      message.success('成本明细已保存');
       onClose();
       onChanged();
     } catch (e) {
@@ -491,7 +556,7 @@ export function EntryDetailDrawer({
 
   return (
     <Drawer
-      title="结算详情"
+      title="成本明细"
       width={620}
       open={!!entryId}
       onClose={onClose}
@@ -499,7 +564,7 @@ export function EntryDetailDrawer({
       extra={
         entry && entry.kind === 'NORMAL' && entry.status !== 'CONFIRMED' ? (
           <Button type="primary" loading={acting} onClick={() => void confirm()}>
-            确认结算
+            确认成本
           </Button>
         ) : null
       }
@@ -521,7 +586,7 @@ export function EntryDetailDrawer({
             <Descriptions.Item label="费用类别">
               {EXPENSE_CATEGORY_LABELS[entry.category]}
             </Descriptions.Item>
-            <Descriptions.Item label="结算周期">{entry.period}</Descriptions.Item>
+            <Descriptions.Item label="成本周期">{entry.period}</Descriptions.Item>
             <Descriptions.Item label="状态">
               <Tag color={ACTUAL_STATUS_COLORS[entry.status]}>{ACTUAL_STATUS_LABELS[entry.status]}</Tag>
             </Descriptions.Item>

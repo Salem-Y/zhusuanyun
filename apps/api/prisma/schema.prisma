@@ -91,6 +91,12 @@ enum CostSourceType {
   OTHER
 }
 
+// 第八轮：测算大宽表成本状态（预测 / 已定标）
+enum CostEstimateStatus {
+  PREDICTED
+  FIXED
+}
+
 /** 第七轮已废弃，保留枚举仅为兼容旧迁移文件；业务不再引用。 */
 
 model User {
@@ -140,6 +146,11 @@ model Project {
   // 第六轮：收入建安税率默认值（%），仅用于合同清单录入时带出，不影响成本模块
   revenueTaxRate Decimal @default(9) @db.Decimal(5, 2)
 
+  // 第八轮：测算大宽表默认不含税税率（%）：人工 3 / 材料 13 / 专业分包 9
+  defaultLaborTaxRate       Decimal @default(3)  @db.Decimal(5, 2)
+  defaultMaterialTaxRate    Decimal @default(13) @db.Decimal(5, 2)
+  defaultSubcontractTaxRate Decimal @default(9)  @db.Decimal(5, 2)
+
   members         ProjectMember[]
   audits          AuditLog[]
   workPackages    WorkPackage[]
@@ -151,6 +162,7 @@ model Project {
   importTemplates ImportMappingTemplate[]
   importLogs      ImportLog[]
   unitProjects    ProjectUnit[]
+  costEstimates   BoqCostEstimate[]
 }
 
 /** 第六轮：单项工程（如 1#楼、2#楼、地下室），清单项与成本明细的维度。 */
@@ -285,6 +297,7 @@ model ProjectBoqItem {
   mergedItems   ProjectBoqItem[] @relation("BoqMerge")
   targetLines   TargetCostLine[]
   actualEntries ActualCostEntry[]
+  costEstimate  BoqCostEstimate?
 
   @@index([projectId, status])
   @@index([projectId, projectCategory])
@@ -410,7 +423,7 @@ model ActualCostEntry {
   unitProjectId String?
   category      ExpenseCategory
   businessDate  DateTime
-  period        String // 结算周期 YYYY-MM
+  period        String? // 成本周期 YYYY-MM（仅过程流水；总账台账为空）
   periodReason  String? // 所属期间与业务日期不一致时必填
   // 第七轮去财务化：成本说明 + 供应商/分包商名称；不再记录发票与来源单据
   description   String            @default("")
@@ -431,6 +444,8 @@ model ActualCostEntry {
 
   kind            ActualEntryKind   @default(NORMAL)
   status          ActualEntryStatus @default(DRAFT)
+  // 第九轮：台账成本状态（预测 / 已定标），默认预测
+  costStatus      CostEstimateStatus @default(PREDICTED)
   createdById     String
   createdByName   String?
   submittedById   String?
@@ -487,4 +502,32 @@ model CostReversalRequest {
 
   @@index([projectId, status])
   @@index([entryId])
+}
+
+/** 第八轮：清单成本测算行（大宽表行级数据）。每个清单项最多一条；展开子行 = 清单项按单项工程拆分。 */
+model BoqCostEstimate {
+  id        String   @id @default(cuid())
+  projectId String
+  boqItemId String   @unique
+  // 第 6 列：实际工程量（可点击直接修改，默认等于清单量）
+  actualQuantity   Decimal? @db.Decimal(24, 3)
+  // 第 11/12/13 列：互斥录入区，均为不含税单价
+  laborPrice       Decimal? @db.Decimal(18, 2)
+  materialPrice    Decimal? @db.Decimal(18, 2)
+  subcontractPrice Decimal? @db.Decimal(18, 2)
+  // 单条特殊税率（%），为空时使用项目默认税率
+  laborTaxRate       Decimal? @db.Decimal(5, 2)
+  materialTaxRate    Decimal? @db.Decimal(5, 2)
+  subcontractTaxRate Decimal? @db.Decimal(5, 2)
+  // 第 14 列：成本状态，默认预测
+  costStatus     CostEstimateStatus @default(PREDICTED)
+  updatedById    String?
+  updatedByName  String?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  project Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  boqItem ProjectBoqItem @relation(fields: [boqItemId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, costStatus])
 }

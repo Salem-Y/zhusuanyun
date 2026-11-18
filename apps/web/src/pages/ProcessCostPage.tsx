@@ -7,6 +7,7 @@ import {
   DatePicker,
   Drawer,
   Empty,
+  Popconfirm,
   Radio,
   Space,
   Statistic,
@@ -36,6 +37,7 @@ import {
   fmtMoney,
 } from './cost/labels';
 import EChart from '../components/EChart';
+import { ActualEntryFormModal } from './cost/ActualEntryForm';
 
 const CALIBER_KEY = 'zs.costCaliber';
 
@@ -50,7 +52,6 @@ function readCaliber(): CostCaliber {
 const MODE_OPTIONS: Array<{ value: ProcessCostMode; label: string }> = [
   { value: 'period', label: '本期数据' },
   { value: 'cumulative', label: '累计数据' },
-  { value: 'forecast', label: '预测目标数据' },
 ];
 
 interface VendorRow {
@@ -77,6 +78,21 @@ export default function ProcessCostPage() {
   const [drill, setDrill] = useState<{ category: ExpenseCategory; label: string } | null>(null);
   const [drillLoading, setDrillLoading] = useState(false);
   const [drillData, setDrillData] = useState<{ targetLines: TargetLine[]; entries: ActualEntry[] } | null>(null);
+  // 第十三轮：流水抽屉内直接修改/删除
+  const [editEntryId, setEditEntryId] = useState<string | null>(null);
+
+  const removeEntry = async (id: string) => {
+    try {
+      await api.deleteActualEntry(project.id, id);
+      message.success('已删除');
+      await load();
+      if (drill) setDrill({ ...drill });
+    } catch (e) {
+      message.error((e as Error).message);
+    }
+  };
+  // 第十一轮：过程统计直接录入本期成本流水
+  const [entryOpen, setEntryOpen] = useState(false);
 
   const untilStr = until.format('YYYY-MM-DD');
   const periodStr = period.format('YYYY-MM');
@@ -162,7 +178,7 @@ export default function ProcessCostPage() {
   const activeCategoryTotal = useMemo(() => {
     if (category === 'all' || !data) return 0;
     const row = data.rows.find((r) => r.key === category);
-    return Number(row?.actual ?? 0);
+    return Number(row?.actualCumulative ?? 0);
   }, [category, data]);
 
   const trendOption = useMemo(() => {
@@ -195,6 +211,46 @@ export default function ProcessCostPage() {
     };
   }, [data, caliberLabel]);
 
+  // 第十一轮：四维柱状对比（收入 / 目标 / 预测 / 实际）
+  const barOption = useMemo(() => {
+    const t = data?.totals;
+    const actualValue = mode === 'period' ? t?.actualPeriod : t?.actualCumulative;
+    return {
+      tooltip: {
+        trigger: 'axis' as const,
+        valueFormatter: (v: number) => `¥${fmtMoney(String(v))}`,
+      },
+      grid: { left: 8, right: 16, top: 32, bottom: 8, containLabel: true },
+      xAxis: {
+        type: 'category' as const,
+        data: ['预算收入', '目标成本', '预测成本', mode === 'period' ? '本期实际' : '累计实际'],
+      },
+      yAxis: {
+        type: 'value' as const,
+        axisLabel: {
+          formatter: (v: number) => (Math.abs(v) >= 10000 ? `${(v / 10000).toFixed(0)}万` : String(v)),
+        },
+      },
+      series: [
+        {
+          type: 'bar' as const,
+          barWidth: 48,
+          label: {
+            show: true,
+            position: 'top' as const,
+            formatter: (p: { value: number }) => `¥${fmtMoney(String(p.value))}`,
+          },
+          data: [
+            { value: Number(t?.budgetRevenue ?? 0), itemStyle: { color: '#52c41a' } },
+            { value: Number(t?.target ?? 0), itemStyle: { color: '#1677ff' } },
+            { value: Number(t?.predicted ?? 0), itemStyle: { color: '#722ed1' } },
+            { value: Number(actualValue ?? 0), itemStyle: { color: '#fa8c16' } },
+          ],
+        },
+      ],
+    };
+  }, [data, mode]);
+
   const overviewColumns: ColumnsType<ProcessCostRow> = [
     {
       title: '费用类别',
@@ -204,15 +260,7 @@ export default function ProcessCostPage() {
         row.key === 'total' ? <Typography.Text strong>{label}</Typography.Text> : label,
     },
     {
-      title: `预算收入（${caliberLabel}）`,
-      dataIndex: 'budgetRevenue',
-      align: 'right',
-      render: (v: string, row) => (
-        <span style={{ fontWeight: row.key === 'total' ? 600 : undefined }}>{fmtMoney(v)}</span>
-      ),
-    },
-    {
-      title: mode === 'forecast' ? '预测成本' : '目标成本',
+      title: '目标成本',
       dataIndex: 'target',
       align: 'right',
       render: (v: string, row) => (
@@ -220,15 +268,31 @@ export default function ProcessCostPage() {
       ),
     },
     {
-      title: '实际成本',
-      dataIndex: 'actual',
+      title: '预测成本',
+      dataIndex: 'predicted',
       align: 'right',
       render: (v: string, row) => (
         <span style={{ fontWeight: row.key === 'total' ? 600 : undefined }}>{fmtMoney(v)}</span>
       ),
     },
     {
-      title: mode === 'period' ? '差额（预算收入 − 实际）' : '差额（目标 − 实际）',
+      title: '本期实际',
+      dataIndex: 'actualPeriod',
+      align: 'right',
+      render: (v: string, row) => (
+        <span style={{ fontWeight: row.key === 'total' ? 600 : undefined }}>{fmtMoney(v)}</span>
+      ),
+    },
+    {
+      title: '累计实际',
+      dataIndex: 'actualCumulative',
+      align: 'right',
+      render: (v: string, row) => (
+        <span style={{ fontWeight: row.key === 'total' ? 600 : undefined }}>{fmtMoney(v)}</span>
+      ),
+    },
+    {
+      title: '差额（目标 − 累计实际）',
       dataIndex: 'diff',
       align: 'right',
       render: (v: string, row) => (
@@ -247,7 +311,7 @@ export default function ProcessCostPage() {
       render: (_, row) => {
         const target = Number(row.target ?? 0);
         if (row.key === 'total' || target === 0) return '—';
-        const rate = ((target - Number(row.actual ?? 0)) / target) * 100;
+        const rate = ((target - Number(row.actualCumulative ?? 0)) / target) * 100;
         return (
           <span style={{ color: rate < 0 ? '#cf1322' : '#389e0d' }}>
             {rate >= 0 ? '+' : ''}
@@ -290,7 +354,7 @@ export default function ProcessCostPage() {
       align: 'right',
       render: (v: string) => fmtMoney(Number(v).toFixed(2)),
     },
-    { title: '结算单据', dataIndex: 'count', width: 100, align: 'right', render: (v: number) => `${v} 笔` },
+    { title: '成本笔数', dataIndex: 'count', width: 100, align: 'right', render: (v: number) => `${v} 笔` },
     { title: '占比', dataIndex: 'share', width: 90, align: 'right', render: (v: number) => `${v}%` },
     {
       title: '流水',
@@ -309,8 +373,6 @@ export default function ProcessCostPage() {
       ),
     },
   ];
-
-  const unallocated = Number(data?.totals.unallocatedRevenue ?? 0);
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
@@ -357,6 +419,11 @@ export default function ProcessCostPage() {
             <Button onClick={() => void load()} loading={loading}>
               刷新
             </Button>
+            {project.status === 'ACTIVE' && (
+              <Button type="primary" onClick={() => setEntryOpen(true)}>
+                录入本期流水
+              </Button>
+            )}
           </Space>
           <Alert
             type="info"
@@ -364,28 +431,39 @@ export default function ProcessCostPage() {
             message={`当前视图：${MODE_OPTIONS.find((m) => m.value === mode)?.label ?? ''}`}
             description={
               <>
-                {mode === 'period'
-                  ? `展示 ${periodStr} 期间发生的已确认实际成本；差额为预算收入 − 实际。`
-                  : mode === 'cumulative'
-                    ? `展示开工至 ${untilStr} 的累计已确认实际成本；差额为目标 − 实际。`
-                    : `预测目标数据：目标列取当前批准版本作为预测完成成本，实际为截至 ${untilStr} 已确认净额。`}
-                预算收入按目标明细金额占比分摊到各费用类别，未分摊部分计入合计。
-                {data?.targetVersion ? ` 目标版本：${data.targetVersion.versionName}。` : ' 尚无批准目标版本。'}
+                <div>
+                  预测与目标数据取自当前总账大盘，不随时间回溯；实际数据按成本周期实时汇总。
+                </div>
+                <div>
+                  {mode === 'period'
+                    ? `本期实际为成本周期等于 ${periodStr} 的流水汇总；累计实际为截至 ${periodStr} 的全部流水。`
+                    : `累计实际为成本周期不晚于 ${untilStr.slice(0, 7)} 的流水汇总。`}
+                  {data?.targetVersion ? ` 目标版本：${data.targetVersion.versionName}。` : ' 尚无批准目标版本。'}
+                </div>
               </>
             }
           />
         </Space>
       </Card>
 
-      <Card size="small" title="实际成本发生趋势（按结算月份）">
+      <Card size="small" title="收入 / 目标 / 预测 / 实际 对比">
+        <EChart option={barOption} height={300} empty={!data} />
+      </Card>
+
+      <Card size="small" title="实际成本发生趋势（按成本月份）">
         <EChart option={trendOption} height={260} empty={(data?.trend?.length ?? 0) === 0} />
       </Card>
 
       <Card size="small">
         <Space size={32} style={{ marginBottom: 16 }} wrap>
           <Statistic
-            title={mode === 'forecast' ? `预测成本合计（${caliberLabel}，元）` : `目标成本合计（${caliberLabel}，元）`}
+            title={`目标成本合计（${caliberLabel}，元）`}
             value={fmtMoney(data?.totals.target ?? '0')}
+            loading={loading}
+          />
+          <Statistic
+            title={`预测成本合计（${caliberLabel}，元）`}
+            value={fmtMoney(data?.totals.predicted ?? '0')}
             loading={loading}
           />
           <Statistic
@@ -394,15 +472,11 @@ export default function ProcessCostPage() {
             loading={loading}
           />
           <Statistic
-            title={`实际成本合计（${caliberLabel}，元）`}
-            value={fmtMoney(data?.totals.actual ?? '0')}
+            title={`${mode === 'period' ? '本期' : '累计'}实际成本（${caliberLabel}，元）`}
+            value={fmtMoney(
+              (mode === 'period' ? data?.totals.actualPeriod : data?.totals.actualCumulative) ?? '0',
+            )}
             loading={loading}
-          />
-          <Statistic
-            title="未分摊预算收入（元）"
-            value={fmtMoney(data?.totals.unallocatedRevenue ?? '0')}
-            loading={loading}
-            valueStyle={unallocated !== 0 ? { color: '#d46b08' } : undefined}
           />
         </Space>
 
@@ -432,7 +506,7 @@ export default function ProcessCostPage() {
             pagination={false}
             dataSource={data?.rows ?? []}
             columns={overviewColumns}
-            locale={{ emptyText: <Empty description="尚无数据；请先批准目标版本并登记结算" /> }}
+            locale={{ emptyText: <Empty description="尚无数据；请先批准目标版本并登记成本" /> }}
             onRow={(row) => ({
               onClick: () => {
                 if (row.key !== 'total') setCategory(row.key as ExpenseCategory);
@@ -455,14 +529,34 @@ export default function ProcessCostPage() {
               pagination={false}
               dataSource={vendorRows}
               columns={vendorColumns}
-              locale={{ emptyText: '该类别本期无已确认结算' }}
+              locale={{ emptyText: '该类别本期暂无成本' }}
             />
           </>
         )}
       </Card>
 
+      <ActualEntryFormModal
+        open={entryOpen}
+        entryId={null}
+        hideCostStatus
+        onClose={() => setEntryOpen(false)}
+        onSaved={() => void load()}
+      />
+
+      <ActualEntryFormModal
+        open={editEntryId !== null}
+        entryId={editEntryId}
+        hideCostStatus
+        onClose={() => setEditEntryId(null)}
+        onSaved={() => {
+          setEditEntryId(null);
+          void load();
+          if (drill) setDrill({ ...drill });
+        }}
+      />
+
       <Drawer
-        title={drill ? `${drill.label} · 结算流水` : '结算流水'}
+        title={drill ? `${drill.label} · 成本流水` : '成本流水'}
         width={820}
         open={!!drill}
         onClose={() => setDrill(null)}
@@ -488,14 +582,14 @@ export default function ProcessCostPage() {
               },
             ]}
           />
-          <Typography.Text strong>结算单据（已确认净额，含冲销）</Typography.Text>
+          <Typography.Text strong>成本明细</Typography.Text>
           <Table
             size="small"
             rowKey="id"
             loading={drillLoading}
             pagination={{ pageSize: 15 }}
             dataSource={drillData?.entries ?? []}
-            locale={{ emptyText: '该类别无已确认单据' }}
+            locale={{ emptyText: '该类别暂无成本明细' }}
             columns={[
               { title: '业务日期', dataIndex: 'businessDate', width: 105, render: (v: string) => fmtDate(v) },
               { title: '成本说明', dataIndex: 'description' },
@@ -505,19 +599,30 @@ export default function ProcessCostPage() {
                 dataIndex: 'amount',
                 width: 125,
                 align: 'right',
-                render: (v: string, e: ActualEntry) => (
-                  <span style={{ color: Number(v) < 0 ? '#cf1322' : undefined }}>
-                    {fmtMoney(v)}
-                    {e.kind === 'REVERSAL' ? '（冲销）' : ''}
-                  </span>
+                render: (v: string) => (
+                  <span style={{ color: Number(v) < 0 ? '#cf1322' : undefined }}>{fmtMoney(v)}</span>
                 ),
               },
               {
-                title: '状态',
-                dataIndex: 'status',
-                width: 88,
-                render: (s: ActualEntry['status']) => (
-                  <Tag color={ACTUAL_STATUS_COLORS[s]}>{ACTUAL_STATUS_LABELS[s]}</Tag>
+                title: '操作',
+                key: 'ops',
+                width: 130,
+                render: (_, e: ActualEntry) => (
+                  <Space size={4}>
+                    <Button size="small" type="link" onClick={() => setEditEntryId(e.id)}>
+                      修改
+                    </Button>
+                    <Popconfirm
+                      title="确认删除该条成本明细？删除后大盘数据将同步扣减"
+                      okText="删除"
+                      cancelText="取消"
+                      onConfirm={() => void removeEntry(e.id)}
+                    >
+                      <Button size="small" type="link" danger>
+                        删除
+                      </Button>
+                    </Popconfirm>
+                  </Space>
                 ),
               },
             ]}

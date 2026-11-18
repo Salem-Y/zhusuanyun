@@ -31,14 +31,20 @@ const EXPENSE_CATEGORIES = [
   'other',
 ] as const;
 
+/** 第十二轮：空字符串按 null 处理，避免 min(1) 校验把可选项判为非法 */
+const emptyToNull = (v: unknown) => (typeof v === 'string' && v.trim() === '' ? null : v);
+
 const entryBodySchema = z.object({
   // 第五轮：关联清单项（可空）＋ 费用类别（必选）
   // 第六轮：单项工程（未关联清单项时必选）＋ 含税/不含税口径
-  boqItemId: z.string().trim().min(1).optional().nullable(),
-  unitProjectId: z.string().trim().min(1).optional().nullable(),
+  boqItemId: z.preprocess(emptyToNull, z.string().trim().min(1).optional().nullable()),
+  unitProjectId: z.preprocess(emptyToNull, z.string().trim().min(1).optional().nullable()),
   category: z.enum(EXPENSE_CATEGORIES, { message: '请选择费用类别' }),
   businessDate: z.string().trim().regex(DATE_RE, '业务日期格式为 YYYY-MM-DD').optional().nullable(),
-  period: z.string().trim().regex(PERIOD_RE, '结算周期格式为 YYYY-MM'),
+  period: z.preprocess(
+    emptyToNull,
+    z.string().trim().regex(PERIOD_RE, '成本周期格式为 YYYY-MM').optional().nullable(),
+  ),
   periodReason: z.string().trim().max(200).optional().nullable(),
   // 第七轮去财务化：成本说明必填，供应商/分包商可空；不再记录发票号与来源单据
   description: z.string().trim().min(1, '请填写成本说明').max(200, '成本说明最多 200 字'),
@@ -52,6 +58,8 @@ const entryBodySchema = z.object({
   priceTaxIncl: z.boolean().optional(),
   basisNote: z.string().trim().max(300).optional().nullable(),
   replaceOfId: z.string().trim().optional().nullable(),
+  // 第九轮：台账成本状态（预测 / 已定标），默认预测
+  costStatus: z.enum(['PREDICTED', 'FIXED']).optional(),
 });
 
 const entryCreateSchema = entryBodySchema.extend({
@@ -117,19 +125,23 @@ async function normalizeEntry(projectId: string, input: z.infer<typeof entryBody
       throw ApiError.badRequest('单项工程与清单项所属单项工程不一致');
     }
   }
-  if (!unitProjectId) throw ApiError.badRequest('未关联清单项时必须选择单项工程');
-  const unit = await prisma.projectUnit.findFirst({
-    where: { id: unitProjectId, projectId, isActive: true },
-    select: { id: true },
-  });
-  if (!unit) throw ApiError.badRequest('单项工程不存在或已停用');
+  // 第十二轮：允许不归属任何单项工程（项目公共费用，如工资、管理费）
+  if (unitProjectId) {
+    const unit = await prisma.projectUnit.findFirst({
+      where: { id: unitProjectId, projectId, isActive: true },
+      select: { id: true },
+    });
+    if (!unit) throw ApiError.badRequest('单项工程不存在或已停用');
+  }
 
-  // 业务日期缺省取结算周期首日，保证月度趋势与结算周期一致
-  const businessDateStr = input.businessDate?.trim() || `${input.period}-01`;
+  // 第十三轮：成本周期仅过程流水需要；总账台账可为空
+  const businessDateStr =
+    input.businessDate?.trim() ||
+    `${input.period ?? new Date().toISOString().slice(0, 7)}-01`;
   const businessDate = new Date(`${businessDateStr}T00:00:00.000Z`);
   if (Number.isNaN(businessDate.getTime())) throw ApiError.badRequest('业务日期无效');
   const datePeriod = businessDateStr.slice(0, 7);
-  if (input.period !== datePeriod && !input.periodReason?.trim()) {
+  if (input.period && input.period !== datePeriod && !input.periodReason?.trim()) {
     throw ApiError.badRequest('所属期间与业务日期不一致，请填写原因');
   }
 
@@ -153,7 +165,7 @@ async function normalizeEntry(projectId: string, input: z.infer<typeof entryBody
     unitPriceTaxExcl = pair.excl;
   } else {
     amountInput = parseMoneyInput(input.amount, '金额');
-    if (!input.basisNote?.trim()) throw ApiError.badRequest('按总额登记必须填写依据说明');
+    // 第十一轮：台账极简录入不再强制依据说明
   }
 
   const amountPair = amountInput !== null
@@ -171,8 +183,9 @@ async function normalizeEntry(projectId: string, input: z.infer<typeof entryBody
     unitProjectId,
     category: input.category,
     businessDate,
-    period: input.period,
-    periodReason: input.period !== datePeriod ? input.periodReason!.trim() : null,
+    period: input.period ?? null,
+    periodReason:
+      input.period && input.period !== datePeriod ? (input.periodReason?.trim() ?? null) : null,
     description: input.description,
     vendorName: input.vendorName?.trim() || null,
     pricingMethod: input.pricingMethod,
@@ -220,6 +233,11 @@ router.get('/:id/actual-entries', async (req, res) => {
   }
   if (until && DATE_RE.test(until)) {
     where.businessDate = { lte: new Date(`${until}T23:59:59.999Z`) };
+  }
+  // 第八轮：按费用类别过滤（子表 2-6 台账）
+  const category = String(req.query.category ?? '');
+  if (category && EXPENSE_CATEGORIES.includes(category as (typeof EXPENSE_CATEGORIES)[number])) {
+    where.category = category as (typeof EXPENSE_CATEGORIES)[number];
   }
   if (view === 'mine-draft') {
     where.createdById = req.user!.id;
@@ -337,18 +355,20 @@ router.post('/:id/actual-entries', async (req, res) => {
       ...data,
       projectId: project.id,
       kind: 'NORMAL',
-      status: parsed.data.submit ? 'SUBMITTED' : 'DRAFT',
+      // 第九轮：废除审批流，录入即计入大盘
+      status: 'CONFIRMED',
+      costStatus: parsed.data.costStatus ?? 'PREDICTED',
       createdById: req.user!.id,
       createdByName: req.user!.displayName,
-      ...(parsed.data.submit
-        ? { submittedById: req.user!.id, submittedByName: req.user!.displayName, submittedAt: now }
-        : {}),
+      submittedById: req.user!.id,
+      submittedByName: req.user!.displayName,
+      submittedAt: now,
       idempotencyKey: parsed.data.idempotencyKey,
     },
   });
   await writeAudit({
     req,
-    action: parsed.data.submit ? 'ACTUAL_CREATE_SUBMIT' : 'ACTUAL_CREATE_DRAFT',
+    action: 'ACTUAL_CREATE',
     objectType: 'ActualCostEntry',
     objectId: created.id,
     projectId: project.id,
@@ -358,38 +378,57 @@ router.post('/:id/actual-entries', async (req, res) => {
 });
 
 router.patch('/:id/actual-entries/:eid', async (req, res) => {
-  const { project } = await assertProjectMembership(req, req.params.id);
+  const { project, membership } = await assertProjectMembership(req, req.params.id);
+  requireProjectRoles(
+    membership,
+    ['COST_ENGINEER', 'PROJECT_LEAD'],
+    '成本明细由造价员或项目负责人维护',
+  );
   assertProjectActive(project);
   const entry = await findEntry(project.id, req.params.eid);
-  if (!['DRAFT', 'RETURNED'].includes(entry.status)) {
-    throw ApiError.conflict('只有草稿或已退回的单据可以编辑；已确认记录请走冲销流程', 'E_ENTRY_LOCKED');
-  }
-  if (entry.createdById !== req.user!.id) throw ApiError.forbidden('只能编辑自己登记的单据');
-
+  // 第九轮：废除审批流，台账明细可直接修改（含成本状态）
   const parsed = entryBodySchema.safeParse(req.body);
   if (!parsed.success) throw ApiError.badRequest(parsed.error.issues[0]?.message ?? '信息不完整');
   const data = await normalizeEntry(project.id, parsed.data);
 
   const updated = await prisma.actualCostEntry.update({
     where: { id: entry.id },
-    data: { ...data, replaceOfId: entry.replaceOfId },
+    data: {
+      ...data,
+      status: 'CONFIRMED',
+      costStatus: parsed.data.costStatus ?? entry.costStatus,
+      replaceOfId: entry.replaceOfId,
+    },
+  });
+  await writeAudit({
+    req,
+    action: 'ACTUAL_UPDATE',
+    objectType: 'ActualCostEntry',
+    objectId: entry.id,
+    projectId: project.id,
+    before: { amount: String(entry.amount), description: entry.description, status: entry.status },
+    after: { amount: String(updated.amount), description: updated.description, status: updated.status },
   });
   res.json({ data: serializeEntry(updated) });
 });
 
 router.delete('/:id/actual-entries/:eid', async (req, res) => {
-  const { project } = await assertProjectMembership(req, req.params.id);
+  const { project, membership } = await assertProjectMembership(req, req.params.id);
+  requireProjectRoles(
+    membership,
+    ['COST_ENGINEER', 'PROJECT_LEAD'],
+    '成本明细由造价员或项目负责人维护',
+  );
   assertProjectActive(project);
   const entry = await findEntry(project.id, req.params.eid);
-  if (!['DRAFT', 'RETURNED'].includes(entry.status) || entry.kind !== 'NORMAL') {
-    throw ApiError.conflict('只有草稿或已退回的单据可以删除；正式记录不允许无痕删除', 'E_ENTRY_LOCKED');
+  if (entry.kind !== 'NORMAL') {
+    throw ApiError.conflict('冲销记录不允许删除', 'E_ENTRY_LOCKED');
   }
-  if (entry.createdById !== req.user!.id) throw ApiError.forbidden('只能删除自己登记的单据');
-
+  // 第九轮：废除冲销审批，台账明细直接物理删除
   await prisma.actualCostEntry.delete({ where: { id: entry.id } });
   await writeAudit({
     req,
-    action: 'ACTUAL_DELETE_DRAFT',
+    action: 'ACTUAL_DELETE',
     objectType: 'ActualCostEntry',
     objectId: entry.id,
     projectId: project.id,

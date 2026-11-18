@@ -1,4 +1,4 @@
-﻿-- CreateEnum
+﻿﻿-- CreateEnum
 CREATE TYPE "BoqProjectCategory" AS ENUM ('divisional', 'measure', 'other');
 
 -- AlterEnum

@@ -59,7 +59,7 @@ export const TARGET_STATUS_COLORS: Record<TargetVersionStatus, string> = {
 export const ACTUAL_STATUS_LABELS: Record<ActualEntryStatus, string> = {
   DRAFT: '草稿',
   SUBMITTED: '待确认',
-  CONFIRMED: '已确认',
+  CONFIRMED: '已保存',
   RETURNED: '已退回',
 };
 

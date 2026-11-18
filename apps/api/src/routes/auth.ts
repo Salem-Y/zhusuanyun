@@ -71,6 +71,8 @@ router.post('/login', async (req, res) => {
   }
 
   await createSession(user.id, req, res);
+  // 登录成功即清零该 IP 的失败计数，避免正常使用被误限流
+  attempts.delete(ip);
   await writeAudit({
     req,
     actorId: user.id,

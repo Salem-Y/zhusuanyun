@@ -118,7 +118,7 @@ export default function ProjectLayout({ onLogout }: { onLogout: () => void }) {
       icon: <AccountBookOutlined />,
       label: '成本工作台',
       children: [
-        { key: 'cost-comparison', label: '清单成本对比' },
+        { key: 'cost-comparison', label: '成本测算总账' },
         { key: 'cost-process', label: '过程成本统计' },
       ],
     },
