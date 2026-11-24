@@ -11,6 +11,7 @@ import ProjectOverviewPage from './pages/ProjectOverviewPage';
 import CostWorkbenchPage from './pages/CostWorkbenchPage';
 import ProcessCostPage from './pages/ProcessCostPage';
 import BoqItemsPage from './pages/BoqItemsPage';
+import ProgressReportPage from './pages/ProgressReportPage';
 import ProjectSettingsPage from './pages/ProjectSettingsPage';
 import SystemSettingsPage from './pages/SystemSettingsPage';
 import NotOpenPage from './pages/NotOpenPage';
@@ -79,6 +80,7 @@ function Shell({ onLogout }: { onLogout: () => void }) {
           <Route path="cost/process" element={<ProcessCostPage />} />
           <Route path="revenue" element={<Navigate to="boq" replace />} />
           <Route path="revenue/boq" element={<BoqItemsPage />} />
+          <Route path="revenue/progress" element={<ProgressReportPage />} />
           <Route path="prices" element={<NotOpenPage title="价格资料" />} />
           <Route path="matters" element={<NotOpenPage title="事项与审批" />} />
           <Route path="reports" element={<NotOpenPage title="报告中心" />} />

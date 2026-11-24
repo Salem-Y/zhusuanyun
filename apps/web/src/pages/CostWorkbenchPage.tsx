@@ -28,6 +28,7 @@ import {
   Typography,
 } from 'antd';
 import {
+  DeleteOutlined,
   EditOutlined,
   FileAddOutlined,
   PlusOutlined,
@@ -204,6 +205,17 @@ export default function CostWorkbenchPage() {
   const rows = comparison?.rows ?? [];
   const totals = comparison?.totals;
 
+  // 按分部工程分组（与合同清单一致的分部维度）
+  const sectionGroups = useMemo(() => {
+    const map = new Map<string, CostComparisonRow[]>();
+    for (const row of rows) {
+      const name = row.sectionName?.trim() || '未划分分部';
+      if (!map.has(name)) map.set(name, []);
+      map.get(name)!.push(row);
+    }
+    return [...map.entries()].map(([name, list]) => ({ name, rows: list }));
+  }, [rows]);
+
   // ===== 第八轮：测算大宽表行内编辑 =====
   /** 未落库的编辑快照（按清单项 id） */
   type EstimateDraft = {
@@ -219,6 +231,10 @@ export default function CostWorkbenchPage() {
   const [drafts, setDrafts] = useState<Record<string, EstimateDraft>>({});
   const [savingKey, setSavingKey] = useState<string | null>(null);
   const [expandedKeys, setExpandedKeys] = useState<string[]>([]);
+  const [estimateSelectedKeys, setEstimateSelectedKeys] = useState<React.Key[]>([]);
+  const [ledgerSelectedKeys, setLedgerSelectedKeys] = useState<React.Key[]>([]);
+  const [batchVoiding, setBatchVoiding] = useState(false);
+  const [batchDeleting, setBatchDeleting] = useState(false);
   const [taxDraft, setTaxDraft] = useState({ labor: '3', material: '13', subcontract: '9' });
   const [taxSaving, setTaxSaving] = useState(false);
 
@@ -296,6 +312,19 @@ export default function CostWorkbenchPage() {
     return { qty, labor, material, sub, unitCost, cost, fallback: unitCost === null };
   };
 
+  /** 分部小计：合并行取其汇总成本，普通行用行内编辑快照 */
+  const sectionSum = (list: CostComparisonRow[]) => {
+    let income = 0;
+    let target = 0;
+    let cost = 0;
+    for (const row of list) {
+      income += Number(row.income ?? 0);
+      target += Number(row.target ?? 0);
+      cost += row.isMerged ? Number(row.cost ?? 0) : rowCalc(row).cost;
+    }
+    return { income: income.toFixed(2), target: target.toFixed(2), cost: cost.toFixed(2) };
+  };
+
   const saveDefaultTaxRates = async () => {
     setTaxSaving(true);
     try {
@@ -348,6 +377,66 @@ export default function CostWorkbenchPage() {
   useEffect(() => {
     void loadLedger();
   }, [loadLedger]);
+
+  useEffect(() => {
+    setLedgerSelectedKeys([]);
+  }, [ledgerCategory]);
+
+  /** 分部分项测算：批量作废清单项（已关联成本明细的由后端跳过） */
+  const doBatchVoidEstimate = async () => {
+    const ids = rows
+      .filter((row) => !row.isMerged && row.boqId && estimateSelectedKeys.includes(row.key))
+      .map((row) => row.boqId as string);
+    if (ids.length === 0) {
+      message.warning('请勾选要作废的清单项（合并汇总行不可选）');
+      return;
+    }
+    setBatchVoiding(true);
+    try {
+      const result = await api.batchVoidBoqItems(project.id, ids);
+      if (result.voided > 0) {
+        message.success(
+          `已作废 ${result.voided} 条清单项${
+            result.skipped.length > 0 ? `，${result.skipped.length} 条因已关联成本被跳过` : ''
+          }`,
+        );
+      } else {
+        message.warning(
+          `未作废任何清单项${result.skipped.length > 0 ? `：${result.skipped.length} 条已关联成本明细` : ''}`,
+        );
+      }
+      setEstimateSelectedKeys([]);
+      await loadAll();
+    } catch (e) {
+      message.error((e as Error).message);
+    } finally {
+      setBatchVoiding(false);
+    }
+  };
+
+  /** 其他费用台账：批量删除成本明细（冲销记录跳过） */
+  const doBatchDeleteLedger = async () => {
+    if (ledgerSelectedKeys.length === 0) return;
+    setBatchDeleting(true);
+    try {
+      const result = await api.batchDeleteActualEntries(
+        project.id,
+        ledgerSelectedKeys.map((key) => String(key)),
+      );
+      message.success(
+        `已删除 ${result.deleted} 条成本明细${
+          result.skipped > 0 ? `，跳过 ${result.skipped} 条冲销记录` : ''
+        }`,
+      );
+      setLedgerSelectedKeys([]);
+      await loadLedger();
+      await loadAll();
+    } catch (e) {
+      message.error((e as Error).message);
+    } finally {
+      setBatchDeleting(false);
+    }
+  };
 
   const voidLedgerEntry = async (entry: ActualEntry) => {
     try {
@@ -658,6 +747,11 @@ export default function CostWorkbenchPage() {
                 </Tag>
               </Tooltip>
             )}
+            {row.isNew && (
+              <Tag color="gold" style={{ marginInlineEnd: 0 }}>
+                新增
+              </Tag>
+            )}
           </Space>
           {row.itemFeature && (
             <Typography.Text type="secondary" style={{ fontSize: 12, display: 'block' }}>
@@ -874,6 +968,25 @@ export default function CostWorkbenchPage() {
         <Button onClick={() => void loadLedger()} loading={ledgerLoading}>
           刷新
         </Button>
+        {canEdit && (
+          <Popconfirm
+            title={`批量删除选中的 ${ledgerSelectedKeys.length} 条成本明细？`}
+            description="删除后大盘数据将同步扣减；冲销记录会自动跳过。"
+            okText="确认删除"
+            okButtonProps={{ danger: true }}
+            disabled={ledgerSelectedKeys.length === 0}
+            onConfirm={() => void doBatchDeleteLedger()}
+          >
+            <Button
+              danger
+              icon={<DeleteOutlined />}
+              disabled={ledgerSelectedKeys.length === 0}
+              loading={batchDeleting}
+            >
+              批量删除（{ledgerSelectedKeys.length}）
+            </Button>
+          </Popconfirm>
+        )}
         <Typography.Text type="secondary">
           下半区 · 台账录入：全部通过「新增成本明细」弹窗录入，可直接修改或删除
         </Typography.Text>
@@ -886,6 +999,10 @@ export default function CostWorkbenchPage() {
         dataSource={ledgerEntries}
         columns={ledgerColumns}
         scroll={{ x: 1200 }}
+        rowSelection={{
+          selectedRowKeys: ledgerSelectedKeys,
+          onChange: (keys) => setLedgerSelectedKeys(keys),
+        }}
         locale={{ emptyText: '该类别暂无成本明细' }}
       />
     </Space>
@@ -1047,69 +1164,120 @@ export default function CostWorkbenchPage() {
               key: 'comparison',
               label: '分部分项测算',
               children: (
-                <Table<CostComparisonRow>
-                  size="small"
-                  rowKey="key"
-                  loading={loading}
-                  pagination={false}
-                  dataSource={rows}
-                  scroll={{ x: 1760 }}
-                  expandable={{
-                    expandedRowKeys: expandedKeys,
-                    onExpandedRowsChange: (keys) => setExpandedKeys(keys as string[]),
-                    expandIcon: () => null,
-                  }}
-                  locale={{
-                    emptyText: (
-                      <Empty description="尚无有效清单项或成本明细；请先在「收入与收付款 → 合同清单」维护清单项" />
-                    ),
-                  }}
-                  columns={columns}
-                  summary={() =>
-                    rows.length > 0 ? (
-                      <Table.Summary fixed>
-                        <Table.Summary.Row>
-                          <Table.Summary.Cell index={0} colSpan={3}>
-                            <Typography.Text strong>合计</Typography.Text>
-                          </Table.Summary.Cell>
-                          <Table.Summary.Cell index={3} align="right">
-                            —
-                          </Table.Summary.Cell>
-                          <Table.Summary.Cell index={4} align="right">
-                            —
-                          </Table.Summary.Cell>
-                          <Table.Summary.Cell index={5} align="right">
-                            <Typography.Text strong>{fmtQty(totals?.actualQuantity ?? '0')}</Typography.Text>
-                          </Table.Summary.Cell>
-                          <Table.Summary.Cell index={6} align="right">
-                            <Typography.Text strong>{fmtMoney(totals?.income ?? '0')}</Typography.Text>
-                          </Table.Summary.Cell>
-                          <Table.Summary.Cell index={7} align="right">
-                            <Typography.Text strong>{fmtMoney(totals?.target ?? '0')}</Typography.Text>
-                          </Table.Summary.Cell>
-                          <Table.Summary.Cell index={8} align="right">
-                            <Typography.Text strong>{fmtMoney(totals?.cost ?? '0')}</Typography.Text>
-                          </Table.Summary.Cell>
-                          <Table.Summary.Cell index={9} align="right">
-                            —
-                          </Table.Summary.Cell>
-                          <Table.Summary.Cell index={10} align="right">
-                            —
-                          </Table.Summary.Cell>
-                          <Table.Summary.Cell index={11} align="right">
-                            —
-                          </Table.Summary.Cell>
-                          <Table.Summary.Cell index={12} align="right">
-                            —
-                          </Table.Summary.Cell>
-                          <Table.Summary.Cell index={13} align="right">
-                            含税 {fmtMoney(totals?.costTaxIncl ?? '0')}
-                          </Table.Summary.Cell>
-                        </Table.Summary.Row>
-                      </Table.Summary>
-                    ) : null
-                  }
-                />
+                <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                  {canEdit && (
+                    <Space wrap>
+                      <Popconfirm
+                        title={`批量作废选中的 ${estimateSelectedKeys.length} 条清单项？`}
+                        description="作废后不再参与测算与汇总；已关联成本明细的会自动跳过。"
+                        okText="确认作废"
+                        okButtonProps={{ danger: true }}
+                        disabled={estimateSelectedKeys.length === 0}
+                        onConfirm={() => void doBatchVoidEstimate()}
+                      >
+                        <Button
+                          danger
+                          icon={<DeleteOutlined />}
+                          disabled={estimateSelectedKeys.length === 0}
+                          loading={batchVoiding}
+                        >
+                          批量作废（{estimateSelectedKeys.length}）
+                        </Button>
+                      </Popconfirm>
+                      <Typography.Text type="secondary">
+                        勾选清单项后批量作废；合并汇总行不可勾选，已关联成本明细的会自动跳过
+                      </Typography.Text>
+                    </Space>
+                  )}
+                  {sectionGroups.length === 0 ? (
+                    <Empty description="尚无有效清单项或成本明细；请先在「收入与收付款 → 合同清单」维护清单项" />
+                  ) : (
+                    <Collapse
+                      size="small"
+                      defaultActiveKey={sectionGroups.slice(0, 1).map((g) => g.name)}
+                      items={sectionGroups.map((group) => {
+                        const sum = sectionSum(group.rows);
+                        return {
+                          key: group.name,
+                          label: (
+                            <Space size={14} wrap>
+                              <Typography.Text strong>{group.name}</Typography.Text>
+                              <Typography.Text type="secondary">{group.rows.length} 项</Typography.Text>
+                              <Typography.Text type="secondary">收入 ¥{fmtMoney(sum.income)}</Typography.Text>
+                              <Typography.Text type="secondary">目标 ¥{fmtMoney(sum.target)}</Typography.Text>
+                              <Typography.Text type="secondary">预测成本 ¥{fmtMoney(sum.cost)}</Typography.Text>
+                            </Space>
+                          ),
+                          children: (
+                            <Table<CostComparisonRow>
+                              size="small"
+                              rowKey="key"
+                              loading={loading}
+                              pagination={false}
+                              dataSource={group.rows}
+                              scroll={{ x: 1760, y: 'calc(100vh - 470px)' }}
+                              rowSelection={{
+                                selectedRowKeys: estimateSelectedKeys,
+                                onChange: (keys) => setEstimateSelectedKeys(keys),
+                                getCheckboxProps: (row) => ({ disabled: row.isMerged || !row.boqId }),
+                              }}
+                              onRow={(row) => (row.isNew ? { style: { background: '#fffbe6' } } : {})}
+                              expandable={{
+                                expandedRowKeys: expandedKeys,
+                                onExpandedRowsChange: (keys) => setExpandedKeys(keys as string[]),
+                                expandIcon: () => null,
+                              }}
+                              locale={{ emptyText: <Empty description="该分部暂无清单项" /> }}
+                              columns={columns}
+                              summary={() => (
+                                <Table.Summary fixed>
+                                  <Table.Summary.Row>
+                                    <Table.Summary.Cell index={0} colSpan={3}>
+                                      <Typography.Text strong>本分部小计</Typography.Text>
+                                    </Table.Summary.Cell>
+                                    <Table.Summary.Cell index={3} align="right">
+                                      —
+                                    </Table.Summary.Cell>
+                                    <Table.Summary.Cell index={4} align="right">
+                                      —
+                                    </Table.Summary.Cell>
+                                    <Table.Summary.Cell index={5} align="right">
+                                      —
+                                    </Table.Summary.Cell>
+                                    <Table.Summary.Cell index={6} align="right">
+                                      <Typography.Text strong>¥{fmtMoney(sum.income)}</Typography.Text>
+                                    </Table.Summary.Cell>
+                                    <Table.Summary.Cell index={7} align="right">
+                                      <Typography.Text strong>¥{fmtMoney(sum.target)}</Typography.Text>
+                                    </Table.Summary.Cell>
+                                    <Table.Summary.Cell index={8} align="right">
+                                      <Typography.Text strong>¥{fmtMoney(sum.cost)}</Typography.Text>
+                                    </Table.Summary.Cell>
+                                    <Table.Summary.Cell index={9} align="right">
+                                      —
+                                    </Table.Summary.Cell>
+                                    <Table.Summary.Cell index={10} align="right">
+                                      —
+                                    </Table.Summary.Cell>
+                                    <Table.Summary.Cell index={11} align="right">
+                                      —
+                                    </Table.Summary.Cell>
+                                    <Table.Summary.Cell index={12} align="right">
+                                      —
+                                    </Table.Summary.Cell>
+                                    <Table.Summary.Cell index={13} align="right">
+                                      —
+                                    </Table.Summary.Cell>
+                                  </Table.Summary.Row>
+                                </Table.Summary>
+                              )}
+                            />
+                          ),
+                        };
+                      })}
+                    />
+                  )}
+                </Space>
               ),
             },
             { key: 'versions', label: '版本与调整记录', children: versionsTab },

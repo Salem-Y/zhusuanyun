@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import * as echarts from 'echarts/core';
 import { BarChart, LineChart, PieChart } from 'echarts/charts';
 import {
+  DataZoomComponent,
   GridComponent,
   LegendComponent,
   TitleComponent,
@@ -19,6 +20,7 @@ echarts.use([
   LegendComponent,
   TitleComponent,
   TooltipComponent,
+  DataZoomComponent,
   CanvasRenderer,
 ]);
 

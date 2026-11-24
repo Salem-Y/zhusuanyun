@@ -14,6 +14,7 @@ import {
 } from '../http/auth';
 import { ApiError } from '../http/errors';
 import { outMoney, outQty, parsePrice, parseQuantity, parseTaxRate, roundMoney, taxPair } from '../http/money';
+import { parseCxXml } from '../boq/cxXml';
 
 const router = Router({ mergeParams: true });
 router.use(requireAuth);
@@ -458,6 +459,57 @@ router.post('/:id/boq-items/:itemId/void', async (req, res) => {
   res.json({ data: serializeItem(item) });
 });
 
+// ============ 批量作废（逐条校验成本引用，被引用的跳过） ============
+const batchIdsSchema = z.object({
+  itemIds: z.array(z.string().trim().min(1)).min(1, '请至少选择 1 条记录').max(500),
+});
+
+router.post('/:id/boq-items/batch-void', async (req, res) => {
+  const { project } = await assertBoqWrite(req, req.params.id);
+  const parsed = batchIdsSchema.safeParse(req.body);
+  if (!parsed.success) throw ApiError.badRequest(parsed.error.issues[0]?.message ?? '请选择要作废的清单项');
+  const ids = [...new Set(parsed.data.itemIds)];
+
+  const items = await prisma.projectBoqItem.findMany({
+    where: { id: { in: ids }, projectId: project.id, status: 'active' },
+    select: { id: true, itemName: true },
+  });
+  const foundIds = items.map((i) => i.id);
+  const [targetGroups, actualGroups] = await Promise.all([
+    prisma.targetCostLine.groupBy({
+      by: ['boqItemId'],
+      where: { boqItemId: { in: foundIds } },
+      _count: { _all: true },
+    }),
+    prisma.actualCostEntry.groupBy({
+      by: ['boqItemId'],
+      where: { boqItemId: { in: foundIds } },
+      _count: { _all: true },
+    }),
+  ]);
+  const referenced = new Set<string>();
+  for (const g of [...targetGroups, ...actualGroups]) {
+    if (g.boqItemId) referenced.add(g.boqItemId);
+  }
+  const voidable = foundIds.filter((id) => !referenced.has(id));
+  const skipped = items
+    .filter((i) => referenced.has(i.id))
+    .map((i) => ({ id: i.id, itemName: i.itemName, reason: '已关联成本明细' }));
+
+  if (voidable.length > 0) {
+    await prisma.projectBoqItem.updateMany({ where: { id: { in: voidable } }, data: { status: 'void' } });
+  }
+  await writeAudit({
+    req,
+    action: 'BOQ_ITEM_BATCH_VOID',
+    objectType: 'ProjectBoqItem',
+    objectId: null,
+    projectId: project.id,
+    after: { requested: ids.length, voided: voidable.length, skipped: skipped.length },
+  });
+  res.json({ data: { voided: voidable.length, skipped, notFound: ids.length - items.length } });
+});
+
 // ============ 导入框架（本轮不做解析写入） ============
 
 const upload = multer({
@@ -622,6 +674,321 @@ router.post('/:id/boq-imports/:logId/confirm', async (req, res) => {
   res.json({
     data: { logId: updated.id, status: updated.status },
     meta: { message: '解析逻辑待模板确认后开放，本次未写入清单数据' },
+  });
+});
+
+// ============ 晨曦/福建计价 XML 工程量清单导入 ============
+
+const xmlUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 },
+});
+
+function uploadXmlSingle(field: string) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    xmlUpload.single(field)(req, res, (err: unknown) => {
+      if (err) {
+        const msg = err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE'
+          ? '文件大小不能超过 20MB'
+          : '文件上传失败，请重试';
+        next(ApiError.badRequest(msg));
+        return;
+      }
+      next();
+    });
+  };
+}
+
+/** 读取上传的 XML 文件并解析，返回文件名与文本。 */
+function readXmlFile(req: Request) {
+  const file = req.file;
+  if (!file) throw ApiError.badRequest('请选择要上传的 XML 文件');
+  const fileName = Buffer.from(file.originalname, 'latin1').toString('utf8').slice(0, 200);
+  if (!/\.xml$/i.test(fileName)) throw ApiError.badRequest('仅支持 .xml 文件（晨曦/福建计价导出）');
+  return { fileName, text: file.buffer.toString('utf8') };
+}
+
+/** 按分类汇总条数与金额（金额取清单合价，避免分部小计缺失）。 */
+function summarizeSections(sections: Array<{ items: Array<{ amount: string }> }>) {
+  let count = 0;
+  let amount = new Decimal(0);
+  for (const section of sections) {
+    for (const item of section.items) {
+      count += 1;
+      amount = amount.add(new Decimal(item.amount || 0));
+    }
+  }
+  return { count, amount: roundMoney(amount).toFixed(2) };
+}
+
+/** 解析草稿写日志时的摘要说明。 */
+function xmlNote(counts: { divisional: number; measure: number; other: number }) {
+  return `XML 解析：分部分项 ${counts.divisional} 条 / 措施项目 ${counts.measure} 条 / 其他项目 ${counts.other} 条`;
+}
+
+/** 预览：解析 XML，返回工程信息、三类清单与分部结构，不写入清单数据。 */
+router.post('/:id/boq-imports/xml-preview', uploadXmlSingle('file'), async (req, res) => {
+  const { project } = await assertBoqWrite(req, String(req.params.id));
+  const { fileName, text } = readXmlFile(req);
+  const parsed = parseCxXml(text);
+
+  const divisional = summarizeSections(parsed.divisional);
+  const measure = summarizeSections(parsed.measure);
+  const other = summarizeSections(parsed.other);
+  const existingItemCount = await prisma.projectBoqItem.count({
+    where: { projectId: project.id, status: 'active' },
+  });
+  // 同名同特征判定为重复项（用于提示“覆盖/保留”）
+  const existingKeys = new Set(
+    (
+      await prisma.projectBoqItem.findMany({
+        where: { projectId: project.id, status: 'active' },
+        select: { projectCategory: true, itemName: true, itemFeature: true },
+      })
+    ).map((i) => `${i.projectCategory}||${i.itemName}||${i.itemFeature ?? ''}`),
+  );
+  const countDuplicates = (
+    category: string,
+    sections: Array<{ items: Array<{ name: string; feature: string | null }> }>,
+  ) =>
+    sections.reduce(
+      (n, s) => n + s.items.filter((i) => existingKeys.has(`${category}||${i.name}||${i.feature ?? ''}`)).length,
+      0,
+    );
+  const duplicateCount =
+    countDuplicates('divisional', parsed.divisional) +
+    countDuplicates('measure', parsed.measure) +
+    countDuplicates('other', parsed.other);
+
+  const log = await prisma.importLog.create({
+    data: {
+      projectId: project.id,
+      fileName,
+      status: 'XML_PREVIEW',
+      headerJson: JSON.parse(
+        JSON.stringify({
+          format: 'cx-xml',
+          project: parsed.project,
+          unitProjectNames: parsed.unitProjectNames,
+        }),
+      ),
+      note: xmlNote({ divisional: divisional.count, measure: measure.count, other: other.count }),
+      createdById: req.user!.id,
+      createdByName: req.user!.displayName ?? req.user!.username,
+    },
+  });
+  await writeAudit({
+    req,
+    action: 'BOQ_IMPORT_XML_PREVIEW',
+    objectType: 'ImportLog',
+    objectId: log.id,
+    projectId: project.id,
+    after: { fileName, summary: { divisional, measure, other } },
+  });
+
+  res.status(201).json({
+    data: {
+      logId: log.id,
+      fileName,
+      project: parsed.project,
+      unitProjectNames: parsed.unitProjectNames,
+      summary: {
+        divisional,
+        measure,
+        other,
+        total: {
+          count: divisional.count + measure.count + other.count,
+          amount: roundMoney(
+            new Decimal(divisional.amount).add(measure.amount).add(other.amount),
+          ).toFixed(2),
+        },
+      },
+      sections: { divisional: parsed.divisional, measure: parsed.measure, other: parsed.other },
+      existingItemCount,
+      duplicateCount,
+    },
+  });
+});
+
+/** 确认导入：重新解析 XML 并批量写入清单项（含税/不含税按项目收入税率换算）。 */
+router.post('/:id/boq-imports/xml-confirm', uploadXmlSingle('file'), async (req, res) => {
+  const { project } = await assertBoqWrite(req, String(req.params.id));
+  const { fileName, text } = readXmlFile(req);
+
+  const logId = String(req.body?.logId ?? '').trim();
+  if (!logId) throw ApiError.badRequest('缺少导入记录，请重新上传文件预览');
+  const log = await prisma.importLog.findFirst({ where: { id: logId, projectId: project.id } });
+  if (!log) throw ApiError.notFound('导入记录不存在，请重新上传文件预览');
+  if (log.status === 'CONFIRMED') throw ApiError.conflict('该文件已完成导入，请勿重复提交');
+
+  const parsed = parseCxXml(text);
+
+  // 目标单项工程：显式选择 > 新建名称 > 文件内单项工程名 > 唯一在用单项工程
+  let unitProjectId = String(req.body?.unitProjectId ?? '').trim();
+  const newUnitName = String(req.body?.newUnitProjectName ?? '').trim();
+  if (!unitProjectId) {
+    const fallbackName = newUnitName || parsed.unitProjectNames[0] || '';
+    if (fallbackName) {
+      const existing = await prisma.projectUnit.findFirst({
+        where: { projectId: project.id, name: fallbackName },
+        select: { id: true },
+      });
+      if (existing) {
+        unitProjectId = existing.id;
+      } else {
+        const created = await prisma.projectUnit.create({
+          data: {
+            projectId: project.id,
+            name: fallbackName,
+            createdById: req.user!.id,
+          },
+          select: { id: true },
+        });
+        unitProjectId = created.id;
+      }
+    } else {
+      const units = await prisma.projectUnit.findMany({
+        where: { projectId: project.id, isActive: true },
+        select: { id: true },
+        take: 2,
+      });
+      if (units.length === 1) unitProjectId = units[0].id;
+      else throw ApiError.badRequest('请选择要导入的单项工程');
+    }
+  }
+  await assertUnitProject(project.id, unitProjectId);
+
+  // 二次导入策略：overwrite=同名同特征覆盖原数据；keep=同名同特征保留原数据，仅新增
+  const mode: 'overwrite' | 'keep' = String(req.body?.mode ?? '') === 'keep' ? 'keep' : 'overwrite';
+  const existingItems = await prisma.projectBoqItem.findMany({
+    where: { projectId: project.id, unitProjectId, status: 'active' },
+    select: { id: true, projectCategory: true, itemName: true, itemFeature: true },
+  });
+  const keyOf = (category: string, name: string, feature: string | null) =>
+    `${category}||${name}||${feature ?? ''}`;
+  const existingByKey = new Map(
+    existingItems.map((i) => [keyOf(i.projectCategory, i.itemName, i.itemFeature), i.id] as const),
+  );
+
+  const defaults = { revenueTaxRate: project.revenueTaxRate };
+  const creates: Prisma.ProjectBoqItemCreateManyInput[] = [];
+  const updates: Array<{ id: string; data: Prisma.ProjectBoqItemUpdateInput }> = [];
+  let kept = 0;
+  let invalid = 0;
+
+  const pushItems = (
+    projectCategory: (typeof BOQ_PROJECT_CATEGORIES)[number],
+    sections: Array<{ name: string; items: Array<{ name: string; feature: string | null; unit: string | null; quantity: string; unitPrice: string }> }>,
+  ) => {
+    for (const section of sections) {
+      for (const item of section.items) {
+        let normalized: ReturnType<typeof normalizeItemBody>;
+        try {
+          normalized = normalizeItemBody(
+            {
+              projectCategory,
+              unitProjectId,
+              sectionName: section.name.slice(0, 120),
+              itemName: item.name.slice(0, 200),
+              itemFeature: item.feature ? item.feature.slice(0, 300) : null,
+              unit: item.unit ? item.unit.slice(0, 20) : null,
+              quantity: item.quantity,
+              taxRate: null,
+              priceTaxIncl: true,
+              unitPrice: item.unitPrice,
+            },
+            defaults,
+          );
+        } catch {
+          invalid += 1;
+          continue;
+        }
+        const key = keyOf(projectCategory, item.name, item.feature);
+        const existingId = existingByKey.get(key);
+        if (existingId) {
+          if (mode === 'overwrite') updates.push({ id: existingId, data: normalized });
+          else kept += 1;
+          continue;
+        }
+        creates.push({
+          ...normalized,
+          projectId: project.id,
+          source: 'import',
+          createdById: req.user!.id,
+          createdByName: req.user!.displayName ?? req.user!.username,
+        });
+      }
+    }
+  };
+  pushItems('divisional', parsed.divisional);
+  pushItems('measure', parsed.measure);
+  pushItems('other', parsed.other);
+
+  if (creates.length + updates.length + kept === 0) {
+    throw ApiError.badRequest(
+      mode === 'keep'
+        ? '本次没有新增清单项（同名同特征项已保留原数据）'
+        : '没有可导入的有效清单项',
+    );
+  }
+  if (creates.length + updates.length > 5000) {
+    throw ApiError.badRequest('单次最多导入 5000 条清单项，请分批导入');
+  }
+
+  const unitProject = await prisma.projectUnit.findUnique({
+    where: { id: unitProjectId },
+    select: { id: true, name: true },
+  });
+
+  const noteParts = [`新增 ${creates.length} 条`, `覆盖 ${updates.length} 条`, `保留 ${kept} 条`];
+  if (invalid > 0) noteParts.push(`跳过无效 ${invalid} 条`);
+
+  await prisma.$transaction([
+    ...updates.map((u) =>
+      prisma.projectBoqItem.update({ where: { id: u.id }, data: u.data }),
+    ),
+    ...(creates.length > 0 ? [prisma.projectBoqItem.createMany({ data: creates })] : []),
+    prisma.importLog.update({
+      where: { id: log.id },
+      data: {
+        status: 'CONFIRMED',
+        note: `已导入：${noteParts.join('，')}`,
+      },
+    }),
+  ]);
+
+  await writeAudit({
+    req,
+    action: 'BOQ_IMPORT_XML_CONFIRM',
+    objectType: 'ImportLog',
+    objectId: log.id,
+    projectId: project.id,
+    after: {
+      fileName,
+      unitProjectId,
+      mode,
+      created: creates.length,
+      updated: updates.length,
+      kept,
+      invalid,
+      categories: {
+        divisional: parsed.divisional.length,
+        measure: parsed.measure.length,
+        other: parsed.other.length,
+      },
+    },
+  });
+
+  res.status(201).json({
+    data: {
+      logId: log.id,
+      status: 'CONFIRMED',
+      created: creates.length,
+      updated: updates.length,
+      kept,
+      skipped: invalid,
+      unitProject,
+    },
   });
 });
 

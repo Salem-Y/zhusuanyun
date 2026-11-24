@@ -163,6 +163,7 @@ model Project {
   importLogs      ImportLog[]
   unitProjects    ProjectUnit[]
   costEstimates   BoqCostEstimate[]
+  progressPeriods ProgressPeriod[]
 }
 
 /** 第六轮：单项工程（如 1#楼、2#楼、地下室），清单项与成本明细的维度。 */
@@ -298,6 +299,7 @@ model ProjectBoqItem {
   targetLines   TargetCostLine[]
   actualEntries ActualCostEntry[]
   costEstimate  BoqCostEstimate?
+  progressLines ProgressBoqLine[]
 
   @@index([projectId, status])
   @@index([projectId, projectCategory])
@@ -530,4 +532,64 @@ model BoqCostEstimate {
   boqItem ProjectBoqItem @relation(fields: [boqItemId], references: [id], onDelete: Cascade)
 
   @@index([projectId, costStatus])
+}
+
+// ============ 第十六轮：过程报量 ============
+
+/** 过程报量期次（按月），同一项目同一期次唯一。 */
+model ProgressPeriod {
+  id            String   @id @default(cuid())
+  projectId     String
+  period        String // YYYY-MM
+  label         String // 如 2026年11月报量
+  createdById   String?
+  createdByName String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  project    Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  boqLines   ProgressBoqLine[]
+  extraLines ProgressExtraLine[]
+
+  @@unique([projectId, period])
+  @@index([projectId, period])
+}
+
+/**
+ * 清单项报量行。
+ * prevCumQty 为创建期次时从上一期带入的上期累计确认量快照，
+ * 本期完成量 = confirmedCumQty - prevCumQty（允许负数，对应甲方倒扣）。
+ */
+model ProgressBoqLine {
+  id              String   @id @default(cuid())
+  periodId        String
+  boqItemId       String
+  prevCumQty      Decimal  @default(0) @db.Decimal(24, 3)
+  confirmedCumQty Decimal  @default(0) @db.Decimal(24, 3)
+  remark          String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  period  ProgressPeriod @relation(fields: [periodId], references: [id], onDelete: Cascade)
+  boqItem ProjectBoqItem @relation(fields: [boqItemId], references: [id], onDelete: Cascade)
+
+  @@unique([periodId, boqItemId])
+  @@index([boqItemId])
+}
+
+/** 本期签证及其他确认行（允许负数）。 */
+model ProgressExtraLine {
+  id                 String   @id @default(cuid())
+  periodId           String
+  name               String
+  prevCumAmount      Decimal  @default(0) @db.Decimal(18, 2)
+  confirmedCumAmount Decimal  @default(0) @db.Decimal(18, 2)
+  remark             String?
+  sortOrder          Int      @default(0)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  period ProgressPeriod @relation(fields: [periodId], references: [id], onDelete: Cascade)
+
+  @@index([periodId])
 }

@@ -156,6 +156,16 @@ router.get('/:id/cost-comparison', async (req, res) => {
       })
     : [];
   const estByBoq = new Map(estimateRows.map((e) => [e.boqItemId, e] as const));
+  // 二次导入后“新增项”标记：仅当项目已至少导入过一次，标记最近一次导入新增的清单项
+  const confirmedImports = await prisma.importLog.findMany({
+    where: { projectId: project.id, status: 'CONFIRMED' },
+    orderBy: { createdAt: 'desc' },
+    take: 2,
+    select: { createdAt: true },
+  });
+  const latestImportAt = confirmedImports.length >= 2 ? confirmedImports[0].createdAt.getTime() : null;
+  const isNewItem = (createdAt: Date) =>
+    latestImportAt !== null && createdAt.getTime() >= latestImportAt;
   const defRates = {
     labor: D(project.defaultLaborTaxRate),
     material: D(project.defaultMaterialTaxRate),
@@ -175,6 +185,8 @@ router.get('/:id/cost-comparison', async (req, res) => {
     unit: string | null;
     unitProjectId: string | null;
     unitProjectName: string | null;
+    sectionName: string | null;
+    isNew: boolean;
     quantity: Prisma.Decimal;
     incomeTaxIncl: Prisma.Decimal;
     incomeTaxExcl: Prisma.Decimal;
@@ -201,6 +213,8 @@ router.get('/:id/cost-comparison', async (req, res) => {
         unit: item.unit,
         unitProjectId: unitProjectId ? item.unitProjectId : null,
         unitProjectName: unitProjectId ? item.unitProject?.name ?? null : null,
+        sectionName: item.sectionName,
+        isNew: isNewItem(item.createdAt),
         quantity: ZERO,
         incomeTaxIncl: ZERO,
         incomeTaxExcl: ZERO,
@@ -214,6 +228,8 @@ router.get('/:id/cost-comparison', async (req, res) => {
       groups.set(key, group);
     }
     groupByBoq.set(item.id, group);
+    if (!group.sectionName && item.sectionName) group.sectionName = item.sectionName;
+    if (isNewItem(item.createdAt)) group.isNew = true;
     group.quantity = group.quantity.add(D(item.quantity));
     group.incomeTaxIncl = group.incomeTaxIncl.add(D(item.amountTaxIncl));
     group.incomeTaxExcl = group.incomeTaxExcl.add(D(item.amountTaxExcl));
@@ -313,6 +329,8 @@ router.get('/:id/cost-comparison', async (req, res) => {
       unit: item.unit,
       unitProjectId: item.unitProjectId,
       unitProjectName: item.unitProject?.name ?? null,
+      sectionName: item.sectionName,
+      isNew: isNewItem(item.createdAt),
       quantity: outQty(item.quantity),
       actualQuantity: outQty(qty),
       income: outMoney(caliber === 'incl' ? incomeIncl : incomeExcl),
@@ -388,6 +406,8 @@ router.get('/:id/cost-comparison', async (req, res) => {
         unit: g.unit,
         unitProjectId: g.unitProjectId,
         unitProjectName: g.unitProjectName,
+        sectionName: g.sectionName,
+        isNew: g.isNew,
         quantity: outQty(g.quantity),
         actualQuantity: outQty(actualQtyDec),
         income: outMoney(incomeByCaliber),

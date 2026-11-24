@@ -9,6 +9,7 @@ import actualCostRoutes from './routes/actualCosts';
 import dictionaryRoutes from './routes/dictionary';
 import healthRoutes from './routes/health';
 import projectRoutes from './routes/projects';
+import progressReportRoutes from './routes/progressReports';
 import targetCostRoutes from './routes/targetCosts';
 import unitProjectRoutes from './routes/unitProjects';
 import userRoutes from './routes/users';
@@ -41,6 +42,7 @@ export function createApp() {
   app.use('/api/projects', targetCostRoutes);
   app.use('/api/projects', actualCostRoutes);
   app.use('/api/projects', costSummaryRoutes);
+  app.use('/api/projects', progressReportRoutes);
   app.use('/api/users', userRoutes);
 
   app.use('/api', (_req, res) => {

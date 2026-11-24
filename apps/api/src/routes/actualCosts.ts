@@ -437,6 +437,45 @@ router.delete('/:id/actual-entries/:eid', async (req, res) => {
   res.json({ data: { ok: true } });
 });
 
+// ============ 批量删除台账明细（冲销记录跳过） ============
+const batchDeleteSchema = z.object({
+  entryIds: z.array(z.string().trim().min(1)).min(1, '请至少选择 1 条记录').max(500),
+});
+
+router.post('/:id/actual-entries/batch-delete', async (req, res) => {
+  const { project, membership } = await assertProjectMembership(req, req.params.id);
+  requireProjectRoles(membership, ['COST_ENGINEER', 'PROJECT_LEAD'], '成本明细由造价员或项目负责人维护');
+  assertProjectActive(project);
+  const parsed = batchDeleteSchema.safeParse(req.body);
+  if (!parsed.success) throw ApiError.badRequest(parsed.error.issues[0]?.message ?? '请选择要删除的成本明细');
+
+  const ids = [...new Set(parsed.data.entryIds)];
+  const entries = await prisma.actualCostEntry.findMany({
+    where: { id: { in: ids }, projectId: project.id },
+    select: { id: true, kind: true, amount: true, description: true },
+  });
+  const deletable = entries.filter((e) => e.kind === 'NORMAL');
+  const skipped = entries.length - deletable.length;
+
+  if (deletable.length > 0) {
+    await prisma.actualCostEntry.deleteMany({ where: { id: { in: deletable.map((e) => e.id) } } });
+  }
+  await writeAudit({
+    req,
+    action: 'ACTUAL_BATCH_DELETE',
+    objectType: 'ActualCostEntry',
+    objectId: null,
+    projectId: project.id,
+    before: {
+      requested: ids.length,
+      deleted: deletable.length,
+      skipped,
+      entries: deletable.slice(0, 50).map((e) => ({ id: e.id, amount: String(e.amount), description: e.description })),
+    },
+  });
+  res.json({ data: { deleted: deletable.length, skipped, notFound: ids.length - entries.length } });
+});
+
 router.post('/:id/actual-entries/:eid/submit', async (req, res) => {
   const { project, membership } = await assertProjectMembership(req, req.params.id);
   requireProjectRoles(membership, ['COST_ENGINEER'], '实际成本由造价员提交');

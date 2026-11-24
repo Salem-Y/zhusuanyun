@@ -126,7 +126,10 @@ export default function ProjectLayout({ onLogout }: { onLogout: () => void }) {
       key: 'revenue',
       icon: <PayCircleOutlined />,
       label: '收入与收付款',
-      children: [{ key: 'revenue-boq', label: '合同清单' }],
+      children: [
+        { key: 'revenue-boq', label: '合同清单' },
+        { key: 'revenue-progress', label: '过程报量' },
+      ],
     },
     { key: 'prices', icon: <TagsOutlined />, label: notOpen('价格资料'), disabled: true },
     { key: 'matters', icon: <AuditOutlined />, label: notOpen('事项与审批'), disabled: true },
@@ -154,6 +157,8 @@ export default function ProjectLayout({ onLogout }: { onLogout: () => void }) {
                 navigate(`/settings/system?fromProject=${project.id}`);
               } else if (key === 'revenue-boq') {
                 navigate(`/projects/${project.id}/revenue/boq`);
+              } else if (key === 'revenue-progress') {
+                navigate(`/projects/${project.id}/revenue/progress`);
               } else if (key === 'cost-comparison') {
                 navigate(`/projects/${project.id}/cost/comparison`);
               } else if (key === 'cost-process') {

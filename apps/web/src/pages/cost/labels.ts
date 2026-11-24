@@ -114,6 +114,8 @@ export const BOQ_IMPORT_STATUS_LABELS: Record<string, string> = {
   HEADERS_READ: '已读取表头',
   MAPPING_SAVED: '映射已保存',
   CONFIRM_PENDING_PARSE: '已确认（待解析开放）',
+  XML_PREVIEW: 'XML 已解析',
+  CONFIRMED: '已导入',
 };
 
 /** 清单导入可映射的系统字段。 */

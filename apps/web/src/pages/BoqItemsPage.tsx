@@ -5,6 +5,7 @@ import {
   Button,
   Card,
   Collapse,
+  Descriptions,
   Form,
   Input,
   InputNumber,
@@ -14,7 +15,6 @@ import {
   Select,
   Space,
   Statistic,
-  Steps,
   Table,
   Tabs,
   Tag,
@@ -26,7 +26,7 @@ import type { TableProps } from 'antd';
 import {
   DeleteOutlined,
   EditOutlined,
-  FileExcelOutlined,
+  ImportOutlined,
   InboxOutlined,
   MergeCellsOutlined,
   PlusOutlined,
@@ -37,8 +37,8 @@ import {
   type BoqItem,
   type BoqListData,
   type BoqProjectCategory,
+  type CxXmlPreviewData,
   type ImportLogItem,
-  type ImportTemplate,
   type UnitProject,
 } from '../api';
 import { useProject } from '../project/ProjectContext';
@@ -47,8 +47,6 @@ import {
   BOQ_IMPORT_STATUS_LABELS,
   BOQ_PROJECT_CATEGORY_KEYS,
   BOQ_PROJECT_CATEGORY_LABELS,
-  BOQ_STATUS_LABELS,
-  BOQ_SYSTEM_FIELD_OPTIONS,
   fmtDateTime,
   fmtMoney,
   fmtQty,
@@ -121,19 +119,17 @@ export default function BoqItemsPage() {
   const [mergePrimaryId, setMergePrimaryId] = useState<string | null>(null);
   const [merging, setMerging] = useState(false);
 
-  // 导入弹窗
+  // 工程量清单（晨曦/福建 XML）导入弹窗
   const [importOpen, setImportOpen] = useState(false);
-  const [importStep, setImportStep] = useState(0);
-  const [uploading, setUploading] = useState(false);
-  const [importLogId, setImportLogId] = useState<string | null>(null);
-  const [importFileName, setImportFileName] = useState('');
-  const [importHeaders, setImportHeaders] = useState<string[]>([]);
-  const [mapping, setMapping] = useState<Record<string, string>>({});
-  const [templates, setTemplates] = useState<ImportTemplate[]>([]);
-  const [templateId, setTemplateId] = useState<string | null>(null);
-  const [templateName, setTemplateName] = useState('');
-  const [savingMapping, setSavingMapping] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [xmlFile, setXmlFile] = useState<File | null>(null);
+  const [xmlPreview, setXmlPreview] = useState<CxXmlPreviewData | null>(null);
+  const [previewCategory, setPreviewCategory] = useState<BoqProjectCategory>('divisional');
+  const [xmlUnitProjectId, setXmlUnitProjectId] = useState<string | null>(null);
+  const [xmlNewUnitName, setXmlNewUnitName] = useState('');
+  const [importMode, setImportMode] = useState<'overwrite' | 'keep'>('overwrite');
+  const [batchVoiding, setBatchVoiding] = useState(false);
 
   const loadRefs = useCallback(async () => {
     try {
@@ -181,16 +177,36 @@ export default function BoqItemsPage() {
 
   const items = listData?.items ?? [];
 
-  // 按分部分类（sectionName）分组展示
-  const groups = useMemo(() => {
-    const map = new Map<string, BoqItem[]>();
+  // 展示层级：单项工程（一级）→ 分部工程（二级）→ 清单项
+  const unitGroups = useMemo(() => {
+    const order = new Map(unitProjects.map((u, i) => [u.id, i]));
+    const map = new Map<
+      string,
+      { key: string; name: string; items: BoqItem[]; sections: Map<string, BoqItem[]> }
+    >();
     for (const item of items) {
-      const key = item.sectionName?.trim() || '未分部分项';
-      if (!map.has(key)) map.set(key, []);
-      map.get(key)!.push(item);
+      const key = item.unitProjectId ?? '__none__';
+      if (!map.has(key)) {
+        map.set(key, {
+          key,
+          name: item.unitProject?.name ?? '未指定单项工程',
+          items: [],
+          sections: new Map(),
+        });
+      }
+      const group = map.get(key)!;
+      group.items.push(item);
+      const sectionName = item.sectionName?.trim() || '未划分分部';
+      if (!group.sections.has(sectionName)) group.sections.set(sectionName, []);
+      group.sections.get(sectionName)!.push(item);
     }
-    return [...map.entries()].map(([name, arr]) => ({ name, items: arr }));
-  }, [items]);
+    return [...map.values()]
+      .sort((a, b) => (order.get(a.key) ?? 999) - (order.get(b.key) ?? 999))
+      .map((group) => ({
+        ...group,
+        sections: [...group.sections.entries()].map(([name, arr]) => ({ name, items: arr })),
+      }));
+  }, [items, unitProjects]);
 
   const selectedItems = useMemo(
     () => items.filter((it) => selectedRowKeys.includes(it.id)),
@@ -292,6 +308,32 @@ export default function BoqItemsPage() {
     }
   };
 
+  const doBatchVoid = async () => {
+    const ids = selectedItems.map((it) => it.id);
+    if (ids.length === 0) return;
+    setBatchVoiding(true);
+    try {
+      const result = await api.batchVoidBoqItems(project.id, ids);
+      if (result.voided > 0) {
+        message.success(
+          `已作废 ${result.voided} 条清单项${
+            result.skipped.length > 0 ? `，${result.skipped.length} 条因已关联成本被跳过` : ''
+          }`,
+        );
+      } else {
+        message.warning(
+          `未作废任何清单项${result.skipped.length > 0 ? `：${result.skipped.length} 条已关联成本明细` : ''}`,
+        );
+      }
+      setSelectedRowKeys([]);
+      await load();
+    } catch (e) {
+      message.error((e as Error).message);
+    } finally {
+      setBatchVoiding(false);
+    }
+  };
+
   const openMerge = () => {
     if (!mergeable) return;
     setMergePrimaryId(selectedItems[0]?.id ?? null);
@@ -320,86 +362,63 @@ export default function BoqItemsPage() {
     }
   };
 
-  // ============ 导入框架 ============
+  // ============ 工程量清单（晨曦/福建 XML）导入 ============
   const resetImport = () => {
-    setImportStep(0);
-    setImportLogId(null);
-    setImportFileName('');
-    setImportHeaders([]);
-    setMapping({});
-    setTemplates([]);
-    setTemplateId(null);
-    setTemplateName('');
+    setXmlFile(null);
+    setXmlPreview(null);
+    setPreviewCategory('divisional');
+    setXmlUnitProjectId(null);
+    setXmlNewUnitName('');
+    setImportMode('overwrite');
   };
 
-  const doUpload = async (file: File) => {
-    setUploading(true);
+  const doXmlPreview = async (file: File) => {
+    setPreviewing(true);
     try {
-      const result = await api.uploadBoqPreview(project.id, file);
-      setImportLogId(result.logId);
-      setImportFileName(result.fileName);
-      setImportHeaders(result.headers);
-      setTemplates(result.templates);
-      setMapping(Object.fromEntries(result.headers.map((h) => [h, 'ignore'])));
-      setImportStep(1);
-      message.success(`已读取 ${result.headers.length} 个表头，请进行字段映射`);
+      const result = await api.previewBoqXml(project.id, file);
+      setXmlFile(file);
+      setXmlPreview(result);
+      const xmlUnitName = result.unitProjectNames[0] ?? '';
+      const matched = unitProjects.find((u) => u.name === xmlUnitName);
+      setXmlUnitProjectId(matched?.id ?? null);
+      setXmlNewUnitName(matched ? '' : xmlUnitName);
+      const firstCategory = (['divisional', 'measure', 'other'] as BoqProjectCategory[]).find(
+        (key) => result.sections[key].length > 0,
+      );
+      setPreviewCategory(firstCategory ?? 'divisional');
     } catch (e) {
       message.error((e as Error).message);
     } finally {
-      setUploading(false);
+      setPreviewing(false);
     }
     return false;
   };
 
-  const applyTemplate = (tid: string | null) => {
-    setTemplateId(tid);
-    const tpl = templates.find((t) => t.id === tid);
-    if (tpl) {
-      setMapping((prev) => {
-        const next = { ...prev };
-        for (const h of importHeaders) {
-          next[h] = (tpl.mapping as Record<string, string>)[h] ?? 'ignore';
-        }
-        return next;
-      });
-    }
-  };
-
-  const doSaveMapping = async () => {
-    if (!importLogId) return;
-    if (!Object.values(mapping).includes('itemName')) {
-      message.warning('必须至少把一列映射为「项目名称」');
+  const doXmlConfirm = async () => {
+    if (!xmlPreview || !xmlFile) return;
+    if (!xmlUnitProjectId && !xmlNewUnitName.trim()) {
+      message.warning('请选择已有单项工程，或填写新建单项工程名称');
       return;
     }
-    setSavingMapping(true);
-    try {
-      await api.saveBoqMapping(project.id, importLogId, {
-        mapping,
-        templateName: templateName.trim() || undefined,
-      });
-      message.success(templateName.trim() ? '映射已保存，模板已命名复用' : '映射已保存');
-      setImportStep(2);
-    } catch (e) {
-      message.error((e as Error).message);
-    } finally {
-      setSavingMapping(false);
-    }
-  };
-
-  const doConfirmImport = async () => {
-    if (!importLogId) return;
     setConfirming(true);
     try {
-      const result = await api.confirmBoqImport(project.id, importLogId);
-      Modal.info({
-        title: '导入已确认',
-        content: result.meta?.message ?? '解析逻辑待模板确认后开放，本次未写入清单数据',
+      const result = await api.confirmBoqXml(project.id, {
+        file: xmlFile,
+        logId: xmlPreview.logId,
+        unitProjectId: xmlUnitProjectId ?? undefined,
+        newUnitProjectName: xmlUnitProjectId ? undefined : xmlNewUnitName.trim() || undefined,
+        mode: importMode,
       });
+      message.success(
+        `已导入到「${result.unitProject?.name ?? '单项工程'}」：新增 ${result.created} 条，覆盖 ${result.updated} 条，保留 ${result.kept} 条${
+          result.skipped > 0 ? `，跳过 ${result.skipped} 条无效数据` : ''
+        }`,
+      );
       setImportOpen(false);
       resetImport();
-      if (tab === 'imports') {
-        setImportLogs(await api.listBoqImports(project.id));
-      }
+      await loadRefs();
+      await load();
+      if (tab === 'imports') setImportLogs(await api.listBoqImports(project.id));
     } catch (e) {
       message.error((e as Error).message);
     } finally {
@@ -412,6 +431,10 @@ export default function BoqItemsPage() {
     priceMode === 'incl' ? item.unitPriceTaxIncl : item.unitPriceTaxExcl;
   const amountOf = (item: BoqItem) =>
     priceMode === 'incl' ? item.amountTaxIncl : item.amountTaxExcl;
+
+  /** 小计（前端仅展示用，精确值以后端十进制为准）。 */
+  const sumAmount = (rows: BoqItem[]) =>
+    rows.reduce((acc, row) => acc + Number(amountOf(row) ?? 0), 0).toFixed(2);
 
   const expandable: TableProps<BoqItem>['expandable'] = {
     rowExpandable: (item) => (item.mergedCount ?? 0) > 0,
@@ -457,12 +480,6 @@ export default function BoqItemsPage() {
           )}
         </div>
       ),
-    },
-    {
-      title: '单项工程',
-      key: 'unitProject',
-      width: 100,
-      render: (_, item) => item.unitProject?.name ?? '—',
     },
     { title: '单位', dataIndex: 'unit', width: 64, render: (v) => v ?? '—' },
     {
@@ -585,8 +602,8 @@ export default function BoqItemsPage() {
             />
             {canWrite && projectActive && (
               <>
-                <Button icon={<FileExcelOutlined />} onClick={() => { resetImport(); setImportOpen(true); }}>
-                  导入 Excel
+                <Button icon={<ImportOutlined />} onClick={() => { resetImport(); setImportOpen(true); }}>
+                  导入工程量清单（晨曦/福建 XML）
                 </Button>
                 <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
                   手动新增
@@ -648,6 +665,23 @@ export default function BoqItemsPage() {
                       <Button icon={<MergeCellsOutlined />} disabled={!mergeable} onClick={openMerge}>
                         合并选中（{selectedItems.length}）
                       </Button>
+                      <Popconfirm
+                        title={`批量作废选中的 ${selectedItems.length} 条清单项？`}
+                        description="作废后不再参与汇总，历史记录保留可追溯；已被成本明细关联的将自动跳过。"
+                        okText="确认作废"
+                        okButtonProps={{ danger: true }}
+                        onConfirm={() => void doBatchVoid()}
+                        disabled={selectedItems.length === 0}
+                      >
+                        <Button
+                          danger
+                          icon={<DeleteOutlined />}
+                          disabled={selectedItems.length === 0}
+                          loading={batchVoiding}
+                        >
+                          批量作废（{selectedItems.length}）
+                        </Button>
+                      </Popconfirm>
                       {selectedItems.length >= 2 && !mergeable && (
                         <Text type="warning" style={{ fontSize: 12 }}>
                           仅项目名称、特征、单位完全一致的清单项可合并
@@ -657,38 +691,77 @@ export default function BoqItemsPage() {
                   )}
 
                   <Collapse
-                    defaultActiveKey={groups.map((g) => g.name)}
-                    items={groups.map((g) => ({
-                      key: g.name,
-                      label: `${g.name}（${g.items.length} 条）`,
+                    defaultActiveKey={unitGroups.map((g) => g.key)}
+                    items={unitGroups.map((group) => ({
+                      key: group.key,
+                      label: (
+                        <Space size={10}>
+                          <Text strong>{group.name}</Text>
+                          <Text type="secondary">
+                            {group.items.length} 条 · 合价（{priceLabel}）¥{fmtMoney(sumAmount(group.items))}
+                          </Text>
+                        </Space>
+                      ),
                       children: (
-                        <Table<BoqItem>
-                          rowKey="id"
+                        <Collapse
+                          ghost
                           size="small"
-                          loading={loading}
-                          columns={columns}
-                          dataSource={g.items}
-                          pagination={false}
-                          scroll={{ x: 1050 }}
-                          expandable={expandable}
-                          rowSelection={
-                            canWrite && projectActive
-                              ? {
-                                  selectedRowKeys,
-                                  onChange: (keys) => setSelectedRowKeys(keys),
+                          defaultActiveKey={group.sections.slice(0, 1).map((s) => s.name)}
+                          items={group.sections.map((section) => ({
+                            key: section.name,
+                            label: `${section.name}（${section.items.length} 条 · ¥${fmtMoney(
+                              sumAmount(section.items),
+                            )}）`,
+                            children: (
+                              <Table<BoqItem>
+                                rowKey="id"
+                                size="small"
+                                loading={loading}
+                                columns={columns}
+                                dataSource={section.items}
+                                pagination={false}
+                                scroll={{ x: 860 }}
+                                expandable={expandable}
+                                rowSelection={
+                                  canWrite && projectActive
+                                    ? {
+                                        selectedRowKeys,
+                                        onChange: (keys) => setSelectedRowKeys(keys),
+                                      }
+                                    : undefined
                                 }
-                              : undefined
-                          }
+                                summary={() => (
+                                  <Table.Summary fixed>
+                                    <Table.Summary.Row>
+                                      {columns.map((_, index) => (
+                                        <Table.Summary.Cell
+                                          key={index}
+                                          index={index}
+                                          align={index === 4 ? 'right' : undefined}
+                                        >
+                                          {index === 0 ? (
+                                            <Text strong>本分部小计</Text>
+                                          ) : index === 4 ? (
+                                            <Text strong>¥{fmtMoney(sumAmount(section.items))}</Text>
+                                          ) : null}
+                                        </Table.Summary.Cell>
+                                      ))}
+                                    </Table.Summary.Row>
+                                  </Table.Summary>
+                                )}
+                              />
+                            ),
+                          }))}
                         />
                       ),
                     }))}
                   />
-                  {!loading && groups.length === 0 && (
+                  {!loading && unitGroups.length === 0 && (
                     <Alert
                       type="info"
                       showIcon
                       message={`「${BOQ_PROJECT_CATEGORY_LABELS[category]}」暂无清单项`}
-                      description="可手动新增，或切换上方其它分类查看。"
+                      description="可手动新增、导入晨曦/福建 XML，或切换上方其它分类查看。"
                     />
                   )}
                 </>
@@ -884,108 +957,201 @@ export default function BoqItemsPage() {
         />
       </Modal>
 
-      {/* 导入弹窗（框架：解析逻辑后续开放） */}
+      {/* 工程量清单（晨曦/福建 XML）导入 */}
       <Modal
-        title="导入合同清单（Excel）"
+        title="导入工程量清单（晨曦/福建 XML）"
         open={importOpen}
         onCancel={() => { setImportOpen(false); resetImport(); }}
-        footer={null}
-        width={760}
+        width={1040}
         destroyOnHidden
+        footer={
+          xmlPreview
+            ? [
+                <Button key="reset" onClick={() => resetImport()}>
+                  重新选择文件
+                </Button>,
+                <Button key="ok" type="primary" loading={confirming} onClick={() => void doXmlConfirm()}>
+                  确认导入（{xmlPreview.summary.total.count} 条）
+                </Button>,
+              ]
+            : null
+        }
       >
-        <Steps
-          current={importStep}
-          size="small"
-          style={{ marginBottom: 20 }}
-          items={[{ title: '上传文件' }, { title: '字段映射' }, { title: '确认导入' }]}
-        />
+        <Upload.Dragger
+          accept=".xml"
+          maxCount={1}
+          showUploadList={false}
+          beforeUpload={(file) => { void doXmlPreview(file); return false; }}
+          disabled={previewing}
+        >
+          <p className="ant-upload-drag-icon"><InboxOutlined /></p>
+          <p className="ant-upload-text">点击或拖拽晨曦/福建计价导出的 XML 文件</p>
+          <p className="ant-upload-hint">
+            识别《福建省房屋建筑与市政基础设施工程造价电子数据交换导则 2017》XML（VER 2.x），
+            自动拆分「分部分项工程费 / 措施项目费 / 其他项目费」；文件不超过 20MB。
+          </p>
+        </Upload.Dragger>
 
-        {importStep === 0 && (
-          <Upload.Dragger
-            accept=".xlsx,.xls,.csv"
-            maxCount={1}
-            showUploadList={false}
-            beforeUpload={(file) => { void doUpload(file); return false; }}
-            disabled={uploading}
-          >
-            <p className="ant-upload-drag-icon"><InboxOutlined /></p>
-            <p className="ant-upload-text">点击或拖拽 Excel 文件到此处上传</p>
-            <p className="ant-upload-hint">支持 .xlsx / .xls / .csv，首行将作为表头读取；文件不超过 5MB。</p>
-          </Upload.Dragger>
-        )}
-
-        {importStep === 1 && (
+        {xmlPreview && (
           <>
-            <Alert
-              type="info"
-              showIcon
-              style={{ marginBottom: 12 }}
-              message={`文件「${importFileName}」读取到 ${importHeaders.length} 个表头，请为每列选择对应的系统字段。`}
-            />
-            {templates.length > 0 && (
-              <Space style={{ marginBottom: 12 }}>
-                <Text type="secondary">套用已保存模板：</Text>
-                <Select
-                  style={{ width: 240 }}
-                  placeholder="选择映射模板"
-                  allowClear
-                  value={templateId}
-                  onChange={applyTemplate}
-                  options={templates.map((t) => ({ value: t.id, label: t.name }))}
-                />
-              </Space>
-            )}
-            <Table
-              rowKey="header"
+            <Descriptions
               size="small"
-              pagination={false}
-              dataSource={importHeaders.map((h) => ({ header: h }))}
-              columns={[
-                { title: 'Excel 列头', dataIndex: 'header', width: 260 },
+              bordered
+              column={3}
+              style={{ marginTop: 16 }}
+              items={[
+                { key: 'name', label: '工程名称', children: xmlPreview.project.name || '—' },
+                { key: 'profession', label: '专业类别', children: xmlPreview.project.profession || '—' },
+                { key: 'bidType', label: '标书类别', children: xmlPreview.project.bidType || '—' },
+                { key: 'priceMethod', label: '计价方式', children: xmlPreview.project.priceMethod || '—' },
                 {
-                  title: '映射到系统字段',
-                  key: 'field',
-                  render: (_, row) => (
-                    <Select
-                      style={{ width: 240 }}
-                      value={mapping[row.header] ?? 'ignore'}
-                      onChange={(v) => setMapping((prev) => ({ ...prev, [row.header]: v }))}
-                      options={BOQ_SYSTEM_FIELD_OPTIONS}
-                    />
-                  ),
+                  key: 'rule',
+                  label: '计价规则',
+                  children: `${xmlPreview.project.ruleName || '—'}${
+                    xmlPreview.project.version ? `（VER ${xmlPreview.project.version}）` : ''
+                  }`,
+                },
+                {
+                  key: 'file',
+                  label: '文件',
+                  children: <Text ellipsis style={{ maxWidth: 260 }} title={xmlPreview.fileName}>{xmlPreview.fileName}</Text>,
                 },
               ]}
             />
-            <Space style={{ marginTop: 12 }}>
-              <Input
-                style={{ width: 240 }}
-                placeholder="模板名称（可选，命名后保存复用）"
-                maxLength={60}
-                value={templateName}
-                onChange={(e) => setTemplateName(e.target.value)}
-              />
-              <Button type="primary" loading={savingMapping} onClick={() => void doSaveMapping()}>
-                保存映射并继续
-              </Button>
-            </Space>
-          </>
-        )}
 
-        {importStep === 2 && (
-          <>
-            <Alert
-              type="warning"
-              showIcon
-              style={{ marginBottom: 16 }}
-              message="解析逻辑待模板确认后开放"
-              description="本轮仅提供导入框架：上传、表头识别、字段映射与模板保存。点击「确认导入」不会写入清单数据，仅记录导入日志。"
-            />
-            <Space>
-              <Button onClick={() => setImportStep(1)}>返回修改映射</Button>
-              <Button type="primary" loading={confirming} onClick={() => void doConfirmImport()}>
-                确认导入
-              </Button>
+            <Space size={32} style={{ margin: '16px 0' }} wrap>
+              {BOQ_PROJECT_CATEGORY_KEYS.map((key) => (
+                <Statistic
+                  key={key}
+                  title={`${BOQ_PROJECT_CATEGORY_LABELS[key]}（含税）`}
+                  value={fmtMoney(xmlPreview.summary[key].amount)}
+                  prefix="¥"
+                  suffix={`/ ${xmlPreview.summary[key].count} 条`}
+                />
+              ))}
+              <Statistic
+                title="清单合计（含税）"
+                value={fmtMoney(xmlPreview.summary.total.amount)}
+                prefix="¥"
+                valueStyle={{ fontWeight: 600 }}
+              />
             </Space>
+
+            {xmlPreview.existingItemCount > 0 && (
+              <Alert
+                type="warning"
+                showIcon
+                style={{ marginBottom: 12 }}
+                message={`本项目已有 ${xmlPreview.existingItemCount} 条有效清单项`}
+                description="本次导入为追加写入，不会覆盖或删除原有清单项；如需重来，请先在清单列表中作废后再导入。"
+              />
+            )}
+
+            <Space direction="vertical" size={8} style={{ width: '100%', marginBottom: 12 }}>
+              <Text strong>导入到单项工程</Text>
+              <Select
+                style={{ width: '100%' }}
+                allowClear
+                placeholder="选择已有单项工程（选择后忽略下方新建名称）"
+                value={xmlUnitProjectId ?? undefined}
+                onChange={(value) => setXmlUnitProjectId(value ?? null)}
+                options={unitProjects.map((u) => ({ value: u.id, label: u.name }))}
+              />
+              {!xmlUnitProjectId && (
+                <Input
+                  style={{ width: '100%' }}
+                  maxLength={60}
+                  placeholder="新建单项工程名称（默认取文件内单项工程名）"
+                  value={xmlNewUnitName}
+                  onChange={(e) => setXmlNewUnitName(e.target.value)}
+                />
+              )}
+            </Space>
+
+            <Space direction="vertical" size={8} style={{ width: '100%', marginBottom: 12 }}>
+              <Text strong>重复清单处理（清单名称 + 项目特征相同）</Text>
+              <Radio.Group value={importMode} onChange={(e) => setImportMode(e.target.value as 'overwrite' | 'keep')}>
+                <Radio value="overwrite">覆盖原数据：更新原清单的单位、工程量、综合单价与合价</Radio>
+                <Radio value="keep">保留原数据：不修改原清单，仅新增未出现过的项目</Radio>
+              </Radio.Group>
+              {xmlPreview.duplicateCount > 0 ? (
+                <Text type="warning">
+                  检测到 {xmlPreview.duplicateCount} 条与本项目已有清单同名同特征，将按上述方式处理。
+                </Text>
+              ) : (
+                <Text type="secondary">未检测到同名同特征清单，本次全部为新增项。</Text>
+              )}
+            </Space>
+
+            <Tabs
+              activeKey={previewCategory}
+              onChange={(key) => setPreviewCategory(key as BoqProjectCategory)}
+              items={BOQ_PROJECT_CATEGORY_KEYS.map((key) => ({
+                key,
+                label: `${BOQ_PROJECT_CATEGORY_LABELS[key]}（${xmlPreview.summary[key].count}）`,
+                children:
+                  xmlPreview.sections[key].length === 0 ? (
+                    <Alert type="info" showIcon message="该分类无清单项" />
+                  ) : (
+                    <Collapse
+                      size="small"
+                      defaultActiveKey={xmlPreview.sections[key].slice(0, 3).map((s) => s.name)}
+                      items={xmlPreview.sections[key].map((section) => ({
+                        key: section.name,
+                        label: `${section.name}（${section.items.length} 条 · ¥${fmtMoney(section.total)}）`,
+                        children: (
+                          <Table
+                            size="small"
+                            rowKey={(row) => `${row.code}-${row.name}-${row.unit}-${row.quantity}`}
+                            pagination={false}
+                            scroll={{ x: 780, y: 300 }}
+                            dataSource={section.items}
+                            columns={[
+                              { title: '编码', dataIndex: 'code', width: 120, render: (v) => v || '—' },
+                              {
+                                title: '清单项名称及特征',
+                                dataIndex: 'name',
+                                render: (_, row) => (
+                                  <div>
+                                    <div>{row.name}</div>
+                                    {row.feature && (
+                                      <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>
+                                        {row.feature}
+                                      </Text>
+                                    )}
+                                  </div>
+                                ),
+                              },
+                              { title: '单位', dataIndex: 'unit', width: 70, render: (v) => v ?? '—' },
+                              {
+                                title: '工程量',
+                                dataIndex: 'quantity',
+                                width: 100,
+                                align: 'right',
+                                render: (v) => fmtQty(v),
+                              },
+                              {
+                                title: '综合单价（含税）',
+                                dataIndex: 'unitPrice',
+                                width: 120,
+                                align: 'right',
+                                render: (v) => fmtMoney(v),
+                              },
+                              {
+                                title: '合价（含税）',
+                                dataIndex: 'amount',
+                                width: 130,
+                                align: 'right',
+                                render: (v) => fmtMoney(v),
+                              },
+                            ]}
+                          />
+                        ),
+                      }))}
+                    />
+                  ),
+              }))}
+            />
           </>
         )}
       </Modal>

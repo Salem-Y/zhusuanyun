@@ -183,6 +183,139 @@ export interface ImportLogItem {
   createdAt: string;
 }
 
+/** 晨曦/福建计价 XML 预览：单条清单项。 */
+export interface CxXmlItemPreview {
+  code: string;
+  name: string;
+  feature: string | null;
+  unit: string | null;
+  quantity: string;
+  unitPrice: string;
+  amount: string;
+}
+
+export interface CxXmlSectionPreview {
+  name: string;
+  total: string;
+  items: CxXmlItemPreview[];
+}
+
+export interface CxXmlProjectInfo {
+  name: string;
+  profession: string;
+  bidType: string;
+  priceMethod: string;
+  ruleName: string;
+  version: string;
+  area: string;
+}
+
+export interface CxXmlPreviewData {
+  logId: string;
+  fileName: string;
+  project: CxXmlProjectInfo;
+  unitProjectNames: string[];
+  summary: {
+    divisional: { count: number; amount: string };
+    measure: { count: number; amount: string };
+    other: { count: number; amount: string };
+    total: { count: number; amount: string };
+  };
+  sections: {
+    divisional: CxXmlSectionPreview[];
+    measure: CxXmlSectionPreview[];
+    other: CxXmlSectionPreview[];
+  };
+  existingItemCount: number;
+  /** 可能与已有清单（同名同特征）重复的条数 */
+  duplicateCount: number;
+}
+
+// ===== 第十六轮：过程报量 =====
+
+export interface ProgressPeriodSummary {
+  id: string;
+  period: string;
+  label: string;
+  createdByName?: string | null;
+  createdAt: string;
+  boqLineCount: number;
+  extraLineCount: number;
+  /** 该期本期产值（按清单行反算，供趋势图使用） */
+  periodAmountIncl: string;
+  periodAmountExcl: string;
+  /** 该期累计确认产值 */
+  cumAmountIncl: string;
+  cumAmountExcl: string;
+}
+
+export interface ProgressBoqLineRow {
+  boqItemId: string;
+  projectCategory: BoqProjectCategory;
+  unitProjectId?: string | null;
+  unitProject?: { id: string; name: string; sortOrder?: number } | null;
+  sectionCode?: string | null;
+  sectionName?: string | null;
+  itemName: string;
+  itemFeature?: string | null;
+  unit?: string | null;
+  quantity?: string | null;
+  unitPriceTaxIncl?: string | null;
+  unitPriceTaxExcl?: string | null;
+  /** 上期累计确认量（系统带入的基数快照） */
+  prevCumQty: string;
+  /** 业主确认累计量 */
+  confirmedCumQty: string;
+  /** 本期完成量 = 业主确认累计 - 上期累计 */
+  periodQty: string;
+  periodAmountIncl: string;
+  periodAmountExcl: string;
+  cumAmountIncl: string;
+  cumAmountExcl: string;
+  remark?: string | null;
+  isNegative: boolean;
+  overContract: boolean;
+}
+
+export interface ProgressTotals {
+  periodAmountIncl: string;
+  periodAmountExcl: string;
+  cumAmountIncl: string;
+  cumAmountExcl: string;
+  count: number;
+}
+
+export interface ProgressExtraLine {
+  id?: string;
+  name: string;
+  prevCumAmount: string;
+  confirmedCumAmount: string;
+  periodAmount: string;
+  remark?: string | null;
+  sortOrder?: number;
+}
+
+export interface ProgressPeriodDetail {
+  period: {
+    id: string;
+    period: string;
+    label: string;
+    createdByName?: string | null;
+    createdAt: string;
+    previousPeriod?: string | null;
+    previousLabel?: string | null;
+  };
+  items: ProgressBoqLineRow[];
+  totals: ProgressTotals & {
+    byCategory: Array<ProgressTotals & { projectCategory: BoqProjectCategory }>;
+  };
+  extras: {
+    lines: ProgressExtraLine[];
+    totals: { prevCumAmount: string; confirmedCumAmount: string; periodAmount: string };
+  };
+  myRole: RoleCode;
+}
+
 export interface TargetVersion {
   id: string;
   versionName: string;
@@ -360,6 +493,10 @@ export interface CostComparisonRow {
   unit?: string | null;
   unitProjectId?: string | null;
   unitProjectName?: string | null;
+  /** 所属分部工程（用于分部分项测算分组） */
+  sectionName?: string | null;
+  /** 最近一次导入后新增的清单项（用于高亮标记） */
+  isNew?: boolean;
   quantity?: string | null;
   actualQuantity?: string | null;
   income: string;
@@ -692,6 +829,18 @@ export const api = {
       body: JSON.stringify({}),
     }).then((r) => r.data),
 
+  batchVoidBoqItems: (projectId: string, itemIds: string[]) =>
+    request<{
+      data: {
+        voided: number;
+        skipped: Array<{ id: string; itemName: string; reason: string }>;
+        notFound: number;
+      };
+    }>(`/projects/${projectId}/boq-items/batch-void`, {
+      method: 'POST',
+      body: JSON.stringify({ itemIds }),
+    }).then((r) => r.data),
+
   // ===== 第五轮：清单导入框架 =====
   uploadBoqPreview: (projectId: string, file: File) => {
     const form = new FormData();
@@ -718,6 +867,93 @@ export const api = {
 
   listBoqImports: (projectId: string) =>
     request<{ data: ImportLogItem[] }>(`/projects/${projectId}/boq-imports`).then((r) => r.data),
+
+  // ===== 晨曦/福建计价 XML 工程量清单导入 =====
+  previewBoqXml: (projectId: string, file: File) => {
+    const form = new FormData();
+    form.append('file', file);
+    return request<{ data: CxXmlPreviewData }>(`/projects/${projectId}/boq-imports/xml-preview`, {
+      method: 'POST',
+      body: form,
+    }).then((r) => r.data);
+  },
+
+  confirmBoqXml: (
+    projectId: string,
+    input: {
+      file: File;
+      logId: string;
+      unitProjectId?: string;
+      newUnitProjectName?: string;
+      /** overwrite=同名同特征覆盖原数据；keep=保留原数据仅新增 */
+      mode?: 'overwrite' | 'keep';
+    },
+  ) => {
+    const form = new FormData();
+    form.append('file', input.file);
+    form.append('logId', input.logId);
+    if (input.unitProjectId) form.append('unitProjectId', input.unitProjectId);
+    if (input.newUnitProjectName) form.append('newUnitProjectName', input.newUnitProjectName);
+    if (input.mode) form.append('mode', input.mode);
+    return request<{
+      data: {
+        logId: string;
+        status: string;
+        created: number;
+        updated: number;
+        kept: number;
+        skipped: number;
+        unitProject: { id: string; name: string } | null;
+      };
+    }>(`/projects/${projectId}/boq-imports/xml-confirm`, { method: 'POST', body: form }).then((r) => r.data);
+  },
+
+  // ===== 第十六轮：过程报量 =====
+  listProgressPeriods: (projectId: string) =>
+    request<{ data: ProgressPeriodSummary[]; meta: { myRole: RoleCode } }>(
+      `/projects/${projectId}/progress-periods`,
+    ).then((r) => ({ periods: r.data, myRole: r.meta.myRole })),
+
+  createProgressPeriod: (projectId: string, input: { period: string; label?: string }) =>
+    request<{
+      data: Pick<ProgressPeriodSummary, 'id' | 'period' | 'label' | 'createdByName' | 'createdAt'>;
+      meta: { carriedFrom: string | null };
+    }>(`/projects/${projectId}/progress-periods`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  getProgressPeriod: (projectId: string, periodId: string) =>
+    request<{ data: ProgressPeriodDetail }>(
+      `/projects/${projectId}/progress-periods/${periodId}`,
+    ).then((r) => r.data),
+
+  saveProgressBoqLines: (
+    projectId: string,
+    periodId: string,
+    lines: Array<{ boqItemId: string; confirmedCumQty: string; remark?: string | null }>,
+  ) =>
+    request<{ data: { saved: number; skipped: number; requested: number } }>(
+      `/projects/${projectId}/progress-periods/${periodId}/boq-lines`,
+      { method: 'PUT', body: JSON.stringify({ lines }) },
+    ).then((r) => r.data),
+
+  saveProgressExtraLines: (
+    projectId: string,
+    periodId: string,
+    lines: Array<{ name: string; confirmedCumAmount: string; remark?: string | null }>,
+  ) =>
+    request<{ data: { saved: number } }>(
+      `/projects/${projectId}/progress-periods/${periodId}/extra-lines`,
+      { method: 'PUT', body: JSON.stringify({ lines }) },
+    ).then((r) => r.data),
+
+  /** 一键清空本期报量：清单确认量回到上期累计，签证明细清空。 */
+  resetProgressPeriod: (projectId: string, periodId: string) =>
+    request<{ data: { resetLines: number; clearedExtras: number; restoredFrom: string | null } }>(
+      `/projects/${projectId}/progress-periods/${periodId}/reset`,
+      { method: 'POST', body: JSON.stringify({}) },
+    ).then((r) => r.data),
 
   // ===== 目标成本 =====
   listTargetVersions: (projectId: string) =>
@@ -828,6 +1064,12 @@ export const api = {
     request<{ data: { ok: boolean } }>(`/projects/${projectId}/actual-entries/${eid}`, { method: 'DELETE' }).then(
       (r) => r.data,
     ),
+
+  batchDeleteActualEntries: (projectId: string, entryIds: string[]) =>
+    request<{ data: { deleted: number; skipped: number; notFound: number } }>(
+      `/projects/${projectId}/actual-entries/batch-delete`,
+      { method: 'POST', body: JSON.stringify({ entryIds }) },
+    ).then((r) => r.data),
 
   submitActualEntry: (projectId: string, eid: string) =>
     request<{ data: ActualEntry }>(`/projects/${projectId}/actual-entries/${eid}/submit`, {
